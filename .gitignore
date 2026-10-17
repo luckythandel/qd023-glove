@@ -1,0 +1,24 @@
+# --- logs & captures ---------------------------------------------------
+logs/*.log
+logs/*.txt
+*.log
+
+# --- python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# --- arduino build artifacts -------------------------------------------
+firmware/**/build/
+firmware/**/*.elf
+firmware/**/*.bin
+firmware/**/*.map
+
+# --- editors / OS ------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+~$*

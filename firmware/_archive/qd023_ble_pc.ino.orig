@@ -1,0 +1,318 @@
+/*
+  QD023 Glove -> PC via BLE (Nordic UART)
+  Device name: QD023-Glove
+  Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+  TX (glove->PC): 6E400003-... notify, RX (PC->glove): 6E400002-... write
+
+  PC runs: pc_receiver.py (bleak + pyautogui)
+  Gestures sent as: "GESTURE:OPEN_PALM\n", "GESTURE:FIST\n", etc.
+  + live percentages: "FINGERS:12,8,5,90,88\n" every 500ms (for game analog)
+
+  Calibration: on boot OPEN 3s then FIST 3s. Send 'c' over Serial to redo.
+  Board: ESP32 Dev Module, COM13, 115200
+*/
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define DEVICE_NAME "QD023-Glove"
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHAR_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // notify to PC
+#define CHAR_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // write from PC
+
+const int FINGER_PINS[5] = {33, 39, 34, 35, 32};
+const char* FINGER_NAMES[5] = {"Thumb","Index","Middle","Ring","Pinky"};
+const int EXTRA_PIN = 36;
+
+Adafruit_MPU6050 mpu;
+bool mpuOK = false;
+
+int openVal[5]  = {600, 0, 0, 0, 0};
+int fistVal[5]  = {365, 531, 586, 890, 784};
+int thresh[5]   = {480, 265, 293, 445, 392};
+int deadb[5]    = {30, 40, 48, 74, 60};
+bool inverted[5] = {true, false, false, false, false};
+bool active[5]   = {true, true, true, true, true};
+// palm orientation templates (mean accel vectors), learned in cal steps 3/4
+float palmVec[3] = {0,0,1}, backVec[3] = {0,0,-1};
+bool oriOK = false;
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pTx = nullptr;
+bool bleConnected = false;
+void doCalibration();
+
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override { bleConnected = true; Serial.println("BLE PC connected"); }
+  void onDisconnect(BLEServer* s) override { bleConnected = false; Serial.println("BLE PC disconnected - advertising"); BLEDevice::startAdvertising(); }
+};
+class RxCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    String v = String(c->getValue().c_str());
+    v.trim();
+    Serial.println("BLE RX: " + v);
+    if (v == "CAL") doCalibration();
+  }
+};
+
+int readAvg(int pin) { long s=0; for(int k=0;k<8;k++){s+=analogRead(pin); delay(2);} return s/8; }
+
+void doCalibration() {
+  Serial.println("\n=== CALIBRATION per finger ===");
+  Serial.println("Step 0: hand FLAT and still in 3s (extended baseline)...");
+  delay(3000);
+  long base[5] = {0,0,0,0,0};
+  for (int s = 0; s < 20; s++) { for (int i = 0; i < 5; i++) base[i] += analogRead(FINGER_PINS[i]); delay(100); }
+  int extVal[5];
+  for (int i = 0; i < 5; i++) extVal[i] = base[i] / 20;
+  Serial.printf("EXT baseline:[%4d %4d %4d %4d %4d]\n", extVal[0],extVal[1],extVal[2],extVal[3],extVal[4]);
+  // Steps 1-5: bend ONLY the named finger, keep others open
+  for (int f = 0; f < 5; f++) {
+    Serial.printf("Step %d/5: bend ONLY %s fully in 3s, hold bent + wiggle it...\n", f+1, FINGER_NAMES[f]);
+    delay(3000);
+    int mn = 4095, mx = 0;
+    long sum = 0;
+    for (int s = 0; s < 40; s++) {
+      int v = analogRead(FINGER_PINS[f]);
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      sum += v;
+      if (s % 5 == 0) Serial.printf("  %s bent-window %s=%4d (others ignored)\n", FINGER_NAMES[f], FINGER_NAMES[f], v);
+      delay(100);
+    }
+    int med = sum / 40;
+    int range = mx - mn;
+    int travel = abs(med - extVal[f]);
+    // keep-old on empty run: table reboot with no hand must not wipe good thresholds
+    if (!(range > 40 && travel > 60)) {
+      Serial.printf(" %s: NO_TRAVEL (ext=%d med=%d range=%d) KEEP_OLD thr=%d %s\n", FINGER_NAMES[f],
+        extVal[f], med, range, thresh[f], active[f] ? "still-OK" : "still-OFF");
+      Serial.println("  Release back to FLAT...");
+      delay(1500);
+      continue;
+    }
+    active[f] = true;
+    if (med > extVal[f]) { openVal[f] = extVal[f] < mn ? extVal[f] : mn; fistVal[f] = mx; inverted[f] = false; }
+    else { openVal[f] = extVal[f] > mx ? extVal[f] : mx; fistVal[f] = mn; inverted[f] = true; }
+    thresh[f] = (extVal[f] + med) / 2;
+    int fullRange = abs(fistVal[f] - openVal[f]);
+    // deadband from SINGLE-bend travel, not full-fist range:
+    // weak travelers (index/pinky) get small bands so solo bends register
+    int travel1 = abs(med - extVal[f]);
+    deadb[f] = travel1 / 8;
+    if (deadb[f] < 12) deadb[f] = 12;
+    if (deadb[f] > 60) deadb[f] = 60;
+    Serial.printf(" %s: ext=%d bentMed=%d bentExt=%d thr=%d range=%d %s %s\n", FINGER_NAMES[f],
+      extVal[f], med, fistVal[f], thresh[f], fullRange,
+      inverted[f] ? "(bent=LOW)" : "(bent=HIGH)", active[f] ? "OK" : "NO_TRAVEL-repeat!");
+    Serial.println("  Release back to FLAT...");
+    delay(1500);
+  }
+  Serial.println("Done fingers. Now ROTATION cal: hold hand FLAT, look at your PALM in 3s...");
+  delay(3000);
+  if (mpuOK) {
+    // step 3: PALM_VIEW (watching palm) 3s mean
+    long ax=0,ay=0,az=0; const int N=30;
+    for(int s=0;s<N;s++){ sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+      ax+=a.acceleration.x*100; ay+=a.acceleration.y*100; az+=a.acceleration.z*100;
+      if(s%10==0) Serial.printf(" palm-view a:(%5.1f,%5.1f,%5.1f)\n",a.acceleration.x,a.acceleration.y,a.acceleration.z);
+      delay(100); }
+    palmVec[0]=ax/N/100.0; palmVec[1]=ay/N/100.0; palmVec[2]=az/N/100.0;
+    Serial.printf("PALM_VIEW vec:(%.1f,%.1f,%.1f)\n",palmVec[0],palmVec[1],palmVec[2]);
+    Serial.println("Now BACK of hand toward you in 3s...");
+    delay(3000);
+    ax=ay=az=0;
+    for(int s=0;s<N;s++){ sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+      ax+=a.acceleration.x*100; ay+=a.acceleration.y*100; az+=a.acceleration.z*100;
+      if(s%10==0) Serial.printf(" back-view a:(%5.1f,%5.1f,%5.1f)\n",a.acceleration.x,a.acceleration.y,a.acceleration.z);
+      delay(100); }
+    backVec[0]=ax/N/100.0; backVec[1]=ay/N/100.0; backVec[2]=az/N/100.0;
+    Serial.printf("BACK_VIEW vec:(%.1f,%.1f,%.1f)\n",backVec[0],backVec[1],backVec[2]);
+    float dot = palmVec[0]*backVec[0]+palmVec[1]*backVec[1]+palmVec[2]*backVec[2];
+    oriOK = true;
+    Serial.printf("rotation templates saved (dot=%.1f, want <40 for clean split).\n", dot);
+  } else Serial.println("no MPU, rotation skipped");
+  Serial.println("Done. Fully OPEN => OPEN_PALM, fully FIST => FIST. Send 'c' to redo.\n");
+}
+
+int bentPct(int i,int raw){
+  int lo,hi;
+  if(inverted[i]){hi=openVal[i];lo=fistVal[i];} else {lo=openVal[i];hi=fistVal[i];}
+  if(hi<=lo) return 0;
+  int p=(raw-lo)*100/(hi-lo);
+  if(p<0)p=0; if(p>100)p=100; return p;
+}
+
+String classify(bool t,bool i,bool m,bool r,bool p,int nActive, const bool ab[5]){
+  auto on = [&](int k)->bool{ return ab[k]; };
+  int bentA = 0; for(int k=0;k<5;k++){ bool b = k==0?t:k==1?i:k==2?m:k==3?r:p; if(on(k)&&b) bentA++; }
+  if(nActive<3) return "NEED_CALIBRATION";
+  if(bentA==0) return "OPEN_PALM";
+  if(bentA==nActive) return "FIST";
+  // named gestures only when all 5 sensors live; with a dead pinky fall back to counts
+  if(nActive==5){
+    if(!i && t && m && r && p) return "INDEX_UP";
+    if(!i && !m && t && r && p) return "PEACE";
+    if(!t && i && m && r && p) return "THUMBS_UP";
+    if(!p && t && i && m && r) return "PINKY_UP";
+  } else {
+    // 4-sensor fallback: index-only extended still means point
+    if(nActive==4 && !i && t && m && r) return "INDEX_UP";
+    if(!i && !m && t && r) return "PEACE";
+  }
+  if(bentA==1) return "ONE_FINGER";
+  if(bentA==2) return "TWO_BENT";
+  if(bentA==3) return "THREE_BENT";
+  if(bentA==4) return "FOUR_BENT";
+  return "PARTIAL";
+}
+
+void bleSend(const String& s){
+  if(bleConnected && pTx){
+    pTx->setValue((uint8_t*)s.c_str(), s.length());
+    pTx->notify();
+  }
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(800);
+  Serial.println("\n=== QD023 BLE-PC Controller ===");
+  Serial.println("Yes: ESP32-WROOM-32D has WiFi 802.11b/g/n + BT4.2 BR/EDR + BLE. This project uses BLE NUS.");
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  for(int i=0;i<5;i++) pinMode(FINGER_PINS[i],INPUT);
+  pinMode(EXTRA_PIN,INPUT);
+#ifdef LED_BUILTIN
+  pinMode(LED_BUILTIN,OUTPUT);
+#endif
+  Wire.begin(21,22);
+  if(mpu.begin(0x68)){ mpuOK=true; mpu.setAccelerometerRange(MPU6050_RANGE_8_G); mpu.setGyroRange(MPU6050_RANGE_500_DEG); mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); Serial.println("MPU6050 OK"); }
+  else Serial.println("MPU6050 missing - fingers only");
+
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCB());
+  BLEService* svc = pServer->createService(SERVICE_UUID);
+  pTx = svc->createCharacteristic(CHAR_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  pTx->addDescriptor(new BLE2902());
+  BLECharacteristic* pRx = svc->createCharacteristic(CHAR_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new RxCB());
+  svc->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising as " DEVICE_NAME " (NUS)");
+
+  doCalibration();
+  bleSend("READY\n");
+}
+
+void loop(){
+  if(Serial.available()){
+    char c=Serial.read();
+    if(c=='c'||c=='C') doCalibration();
+  }
+  int raw[5];
+  for(int i=0;i<5;i++) raw[i]=analogRead(FINGER_PINS[i]);
+  int pct[5]; bool bent[5]; int nActive=0;
+  static bool prevBent[5] = {false,false,false,false,false};
+  static float sm[5] = {0,0,0,0,0};
+  static bool smInit = false;
+  if(!smInit){ for(int i=0;i<5;i++) sm[i]=raw[i]; smInit=true; }
+  for(int i=0;i<5;i++){
+    if(!active[i]){pct[i]=0;bent[i]=false;prevBent[i]=false;sm[i]=raw[i];continue;}
+    sm[i] = 0.35*raw[i] + 0.65*sm[i]; // smooth pot noise/linkage jitter
+    int v = (int)(sm[i]+0.5);
+    nActive++; pct[i]=bentPct(i,v);
+    int DB = deadb[i]; // range-scaled per finger
+    bool b;
+    if(!inverted[i]){ // bent = HIGH
+      if(v > thresh[i]+DB) b=true;
+      else if(v < thresh[i]-DB) b=false;
+      else b=prevBent[i];
+    } else { // bent = LOW
+      if(v < thresh[i]-DB) b=true;
+      else if(v > thresh[i]+DB) b=false;
+      else b=prevBent[i];
+    }
+    bent[i]=b; prevBent[i]=b;
+  }
+  String g=classify(bent[0],bent[1],bent[2],bent[3],bent[4],nActive,active);
+
+  static String last="",cand=""; static int n=0;
+  if(g==cand) n++; else {cand=g; n=1;}
+  bool changed=false;
+  if(n>=3 && cand!=last){ last=cand; changed=true; }
+
+  // per-finger edge events: each finger independently actionable
+  for(int i=0;i<5;i++){
+    static bool lastB[5]={false,false,false,false,false};
+    static bool initB=false;
+    if(!initB){ lastB[i]=bent[i]; if(i==4) initB=true; continue; }
+    if(bent[i]!=lastB[i]){
+      lastB[i]=bent[i];
+      String fm = String("FINGER:")+FINGER_NAMES[i]+String(":")+(bent[i]?"BENT":"EXT")+String("\n");
+      bleSend(fm);
+      Serial.println(">>> "+fm.substring(0,fm.length()-1)+(bleConnected?" [BLE sent]":" [BLE no PC]"));
+    }
+  }
+
+  // palm orientation: nearest learned template (PALM_VIEW vs BACK_VIEW)
+  String rot="UNKNOWN";
+  if(mpuOK && oriOK){
+    sensors_event_t a,gg,t; mpu.getEvent(&a,&gg,&t);
+    float ax=a.acceleration.x, ay=a.acceleration.y, az=a.acceleration.z;
+    float dp=(ax*palmVec[0]+ay*palmVec[1]+az*palmVec[2]);
+    float db=(ax*backVec[0]+ay*backVec[1]+az*backVec[2]);
+    rot = (dp>=db) ? "PALM_VIEW" : "BACK_VIEW";
+  } else if(mpuOK) {
+    // fallback before rotation cal: rough tilt
+    sensors_event_t a,gg,t; mpu.getEvent(&a,&gg,&t);
+    float pitch=atan2(-a.acceleration.x,sqrt(a.acceleration.y*a.acceleration.y+a.acceleration.z*a.acceleration.z))*180/PI;
+    float roll=atan2(a.acceleration.y,a.acceleration.z)*180/PI;
+    if(roll>35) rot="TILT_RIGHT"; else if(roll<-35) rot="TILT_LEFT";
+    else if(pitch>35) rot="TILT_BACK"; else if(pitch<-35) rot="TILT_FWD"; else rot="FLAT";
+  }
+  static String lastRot="",candRot=""; static int nR=0;
+  if(rot==candRot) nR++; else {candRot=rot; nR=1;}
+  if(nR>=4 && candRot!=lastRot){ lastRot=candRot;
+    bleSend(String("ROT:")+lastRot+"\n");
+    Serial.println(">>> ROT:"+lastRot+(bleConnected?" [BLE sent]":" [BLE no PC]"));
+  }
+  String tilt = (lastRot=="PALM_VIEW"||lastRot=="BACK_VIEW") ? lastRot : "";
+
+  if(changed){
+    String msg="GESTURE:"+last+"\n";
+    bleSend(msg);
+    Serial.println(">>> "+last+(tilt.length()?" +"+tilt:"")+(bleConnected?" [BLE sent]":" [BLE no PC]"));
+#ifdef LED_BUILTIN
+    digitalWrite(LED_BUILTIN,HIGH); delay(80); digitalWrite(LED_BUILTIN,LOW);
+#endif
+  }
+
+  static unsigned long lastLive=0;
+  if(millis()-lastLive>600){
+    lastLive=millis();
+    char buf[64];
+    snprintf(buf,sizeof(buf),"FINGERS:%d,%d,%d,%d,%d\n",pct[0],pct[1],pct[2],pct[3],pct[4]);
+    bleSend(String(buf));
+    // live isolation view: raw + T/I/M/R/P (1=bent) so single-finger moves are visible
+    Serial.printf("fingers T:%d I:%d M:%d R:%d P:%d raw:[%4d %4d %4d %4d %4d] => %s\n",
+      bent[0]?1:0,bent[1]?1:0,bent[2]?1:0,bent[3]?1:0,bent[4]?1:0,
+      raw[0],raw[1],raw[2],raw[3],raw[4],last.c_str());
+  }
+
+#ifdef LED_BUILTIN
+  // slow blink = waiting for PC, solid-ish fast = connected
+  static unsigned long lb=0; static bool led=false;
+  unsigned long iv = bleConnected?900:350;
+  if(millis()-lb>iv){lb=millis();led=!led;digitalWrite(LED_BUILTIN,led);}
+#endif
+  delay(150);
+}
