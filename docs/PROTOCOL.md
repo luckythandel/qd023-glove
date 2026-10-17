@@ -22,6 +22,11 @@ Every message is newline-terminated (`\n`).
 | `FINGERS:p0,p1,p2,p3,p4` | every 600 ms | `FINGERS:0,82,0,95,0` |
 | `FINGER:<name>:BENT\|EXT` | single finger crossing | `FINGER:Index:BENT` |
 | `ROT:<label>` | rotation changed and held 4 samples (~600 ms) | `ROT:PALM_VIEW` |
+| `TWIST:<deg>` | wrist twist changed ≥1° (or every 500 ms) | `TWIST:-37` |
+
+`TWIST` is a **signed angle in degrees** since the last zero: positive = clockwise,
+negative = anticlockwise. It is integrated from the gyro about the axis chosen during
+calibration, with a ±3 °/s deadband so it doesn't drift while your hand is still.
 
 `FINGERS` values are **0–100 %** of that finger's travel from OPEN to FLEXED
 (not raw ADC).
@@ -55,6 +60,7 @@ TILT_LEFT  TILT_RIGHT  TILT_FWD  TILT_BACK  FLAT
 | `c` | recalibrate now |
 | `d` | toggle the 5-finger raw dump (incl. spare `G33`) |
 | `s` | toggle full **ADC1 sweep** `32,33,34,35,36,37,38,39` — use to find which pin a finger drives |
+| `z` | zero the wrist-twist angle |
 | `h` | print help |
 
 ### Output lines

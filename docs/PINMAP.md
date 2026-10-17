@@ -96,6 +96,38 @@ a run where the glove never moved produced `dot = 100.9` and meaningless templat
 
 Tilt fallback thresholds: ±35° on pitch and roll.
 
+## Wrist twist (clockwise / anticlockwise + degrees)
+
+`PALM_VIEW` / `BACK_VIEW` is a two-state guess from the accelerometer — it says
+which way the palm faces, but not how far you turned or in which direction.
+
+The gyro can: rotate the wrist (pronation / supination) and the gyro reports an
+angular **rate**. Integrate it over time and you get a signed angle.
+
+Calibration learns two things automatically:
+
+1. **Zero-rate bias** — 1.5 s of holding still, averaged per axis. Without this the
+   integration drifts even when you're motionless.
+2. **Which axis and which sign** — you rotate the wrist **clockwise** for 3 s; the
+   axis with the largest mean rate is the wrist axis, and the sign of that mean
+   becomes "clockwise = positive".
+
+Runtime:
+
+```
+rate  = (gyro[axis] - bias[axis]) * sign * 57.2958   // deg/s
+rate  = 0 if |rate| < 3 deg/s                        // deadband, kills drift
+angle += rate * dt                                   // dt clamped to 0.5 s
+```
+
+Emitted as `TWIST:<deg>`, clamped to ±720°, and zeroed by the `z` command.
+
+**Drift note:** pure integration accumulates error over minutes. The deadband and
+bias cancelling handle the common case (reporting a twist gesture), and `z` gives a
+manual re-zero. A drift-free absolute angle would need the accelerometer gravity
+vector to anchor the gyro — that is the natural next step if you want it to stay
+accurate across long sessions.
+
 ## LED
 
 | State | Blink |

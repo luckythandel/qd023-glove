@@ -67,6 +67,14 @@ float palmVec[3] = {0, 0, 1};
 float backVec[3] = {0, 0, -1};
 bool  oriOK = false;
 
+// ---- wrist twist (pronation / supination) ----
+// The accelerometer can only say "palm or back"; the gyro can say how fast and
+// which way. We integrate the calibrated axis to get a signed angle in degrees.
+int   twistAxis   = 2;        // 0=x 1=y 2=z, chosen during calibration
+float twistSign   = 1.0f;     // flips the axis so CLOCKWISE is positive
+float gyroBias[3] = {0, 0, 0};
+float twistAngle  = 0.0f;     // degrees since the last zero
+
 Adafruit_MPU6050 mpu;
 bool mpuOK = false;
 
@@ -266,7 +274,47 @@ void doCalibration() {
     Serial.println("no MPU -> rotation disabled");
   }
 
-  Serial.println("=== calibration done. 'c' to redo, 'd' for raw diagnostics ===");
+  /* ---- stage D: wrist twist axis ---- */
+  if (mpuOK) {
+    Serial.println("Twist cal: hold STILL 2s (gyro zero reference)...");
+    delay(2000);
+    float bx = 0, by = 0, bz = 0;
+    const int NB = 150;
+    for (int s = 0; s < NB; s++) {
+      sensors_event_t a, g, t;
+      mpu.getEvent(&a, &g, &t);
+      bx += g.gyro.x; by += g.gyro.y; bz += g.gyro.z;
+      delay(10);
+    }
+    gyroBias[0] = bx / NB;
+    gyroBias[1] = by / NB;
+    gyroBias[2] = bz / NB;
+    Serial.printf("gyro zero: %.3f %.3f %.3f rad/s\n", gyroBias[0], gyroBias[1], gyroBias[2]);
+
+    Serial.println("Twist cal: rotate wrist CLOCKWISE (like turning a key) 3s, starting in 2s...");
+    delay(2000);
+    float sx = 0, sy = 0, sz = 0;
+    const int NS = 150;
+    for (int s = 0; s < NS; s++) {
+      sensors_event_t a, g, t;
+      mpu.getEvent(&a, &g, &t);
+      sx += (g.gyro.x - gyroBias[0]);
+      sy += (g.gyro.y - gyroBias[1]);
+      sz += (g.gyro.z - gyroBias[2]);
+      delay(20);
+    }
+    sx /= NS; sy /= NS; sz /= NS;
+    float axv = fabs(sx), ayv = fabs(sy), azv = fabs(sz);
+    if (azv >= axv && azv >= ayv) { twistAxis = 2; twistSign = (sz >= 0) ? 1.0f : -1.0f; }
+    else if (ayv >= axv)          { twistAxis = 1; twistSign = (sy >= 0) ? 1.0f : -1.0f; }
+    else                          { twistAxis = 0; twistSign = (sx >= 0) ? 1.0f : -1.0f; }
+    twistAngle = 0.0f;
+    Serial.printf("twist axis=%c sign=%s (mean rates x=%.2f y=%.2f z=%.2f rad/s)\n",
+                  twistAxis == 0 ? 'x' : (twistAxis == 1 ? 'y' : 'z'),
+                  twistSign > 0 ? "+" : "-", sx, sy, sz);
+  }
+
+  Serial.println("=== calibration done. 'c' to redo, 'd' raw, 's' ADC scan, 'z' zero twist ===");
   Serial.println();
 }
 
@@ -377,7 +425,7 @@ void setup() {
 }
 
 void printHelp() {
-  Serial.println("commands:  c = recalibrate   d = raw 5-pin dump   s = full ADC1 scan (32..39)   h = help");
+  Serial.println("commands:  c = recalibrate   d = raw 5-pin dump   s = ADC1 scan   z = zero twist   h = help");
 }
 
 /* ---------------- main loop ---------------- */
@@ -392,6 +440,7 @@ void loop() {
     if (c == 'c' || c == 'C') doCalibration();
     else if (c == 'd' || c == 'D') { rawDump = !rawDump; Serial.printf("raw dump %s\n", rawDump ? "ON" : "OFF"); }
     else if (c == 's' || c == 'S') { scanMode = !scanMode; Serial.printf("ADC scan %s\n", scanMode ? "ON" : "OFF"); }
+    else if (c == 'z' || c == 'Z') { twistAngle = 0.0f; Serial.println("twist zeroed"); }
     else if (c == 'h' || c == 'H') printHelp();
   }
 
@@ -486,6 +535,40 @@ void loop() {
     lastRot = candRot;
     bleSend(String("ROT:") + lastRot + "\n");
     Serial.println(">>> ROT:" + lastRot + (bleConnected ? " [BLE]" : " [local]"));
+  }
+
+  /* ---- wrist twist: integrate the gyro about the calibrated axis ---- */
+  static unsigned long lastTwistMs = 0;
+  static float         lastTwistSent = 0.0f;
+  static unsigned long lastTwistTx = 0;
+
+  if (mpuOK) {
+    unsigned long nowMs = millis();
+    float dt = (nowMs - lastTwistMs) / 1000.0f;
+    lastTwistMs = nowMs;
+    if (dt > 0.5f) dt = 0.5f;
+
+    sensors_event_t ta, tg, tt;
+    mpu.getEvent(&ta, &tg, &tt);
+    float rawRate = (twistAxis == 0) ? tg.gyro.x
+                  : (twistAxis == 1) ? tg.gyro.y
+                                     : tg.gyro.z;
+    float rate = (rawRate - gyroBias[twistAxis]) * twistSign * 57.2958f;  // deg/s
+    if (fabs(rate) < 3.0f) rate = 0.0f;      // deadband: no drift while still
+    twistAngle += rate * dt;
+    if (twistAngle >  720.0f) twistAngle =  720.0f;
+    if (twistAngle < -720.0f) twistAngle = -720.0f;
+
+    if (fabs(twistAngle - lastTwistSent) >= 1.0f || (millis() - lastTwistTx) > 500) {
+      lastTwistSent = twistAngle;
+      lastTwistTx = millis();
+      char tb[24];
+      snprintf(tb, sizeof(tb), "TWIST:%d\n", (int)(twistAngle + (twistAngle >= 0 ? 0.5f : -0.5f)));
+      bleSend(String(tb));
+      Serial.printf("TWIST %+d deg (%s) rate %.1f deg/s\n",
+                    (int)(twistAngle + (twistAngle >= 0 ? 0.5f : -0.5f)),
+                    twistAngle >= 0 ? "CW" : "CCW", rate);
+    }
   }
 
   if (changed) {
