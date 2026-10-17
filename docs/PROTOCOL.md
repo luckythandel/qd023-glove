@@ -53,7 +53,8 @@ TILT_LEFT  TILT_RIGHT  TILT_FWD  TILT_BACK  FLAT
 | Key | Effect |
 |---|---|
 | `c` | recalibrate now |
-| `d` | toggle the raw ADC dump (includes `G36`) |
+| `d` | toggle the 5-finger raw dump (incl. spare `G33`) |
+| `s` | toggle full **ADC1 sweep** `32,33,34,35,36,37,38,39` — use to find which pin a finger drives |
 | `h` | print help |
 
 ### Output lines

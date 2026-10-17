@@ -58,7 +58,7 @@ bool active[N_FINGERS]  = {true, true, true, true, true};
 // fraction of travel from OPEN at which a finger counts as bent.
 // tutorial's fixed 200 on a 0..1000 swing is ~20-35% -> this matches it.
 #define BEND_FRACTION 0.32f
-#define MIN_TRAVEL    120     // below this the sensor is considered unusable
+#define MIN_TRAVEL    80      // below this the finger is ignored as unusable
 #define REST_TRAVEL   60      // tutorial's "NO_TRAVEL" guard for empty runs
 
 /* ---------------- rotation ---------------- */
@@ -174,8 +174,10 @@ void doCalibration() {
     int travel = abs(med - ext[f]);
     int range  = mx - mn;
 
-    // reject a window the user slept through, or a dead wire
-    if (range < 40 || travel < REST_TRAVEL) {
+    // A HELD bend has almost no in-window range but a large travel from the
+    // OPEN baseline, so travel is the primary evidence, range only a fallback.
+    // (The old "range < 40" test rejected perfectly good held bends.)
+    if (travel < REST_TRAVEL && range < REST_TRAVEL) {
       Serial.printf(" %s: NO_TRAVEL (open=%d bent=%d range=%d) -> KEEP_OLD thr=%d %s\n",
                     FINGER_NAMES[f], ext[f], med, range, thresh[f],
                     active[f] ? "still-OK" : "still-OFF");
@@ -183,10 +185,10 @@ void doCalibration() {
       delay(1200);
       continue;
     }
-    if (travel < MIN_TRAVEL) {
+    if (travel < MIN_TRAVEL && range < MIN_TRAVEL) {
       active[f] = false;
-      Serial.printf(" %s: WEAK (travel=%d < %d) -> marked INACTIVE\n",
-                    FINGER_NAMES[f], travel, MIN_TRAVEL);
+      Serial.printf(" %s: WEAK (travel=%d range=%d) -> marked INACTIVE (bend it fully)\n",
+                    FINGER_NAMES[f], travel, range);
       Serial.println("   back to FLAT...");
       delay(1200);
       continue;
@@ -375,20 +377,31 @@ void setup() {
 }
 
 void printHelp() {
-  Serial.println("commands:  c = recalibrate    d = toggle raw pin dump    h = help");
+  Serial.println("commands:  c = recalibrate   d = raw 5-pin dump   s = full ADC1 scan (32..39)   h = help");
 }
 
 /* ---------------- main loop ---------------- */
 
 void loop() {
-  static bool rawDump = false;
+  static bool rawDump   = false;
+  static bool scanMode  = false;
 
   /* ---- serial console ---- */
   while (Serial.available()) {
     char c = Serial.read();
     if (c == 'c' || c == 'C') doCalibration();
     else if (c == 'd' || c == 'D') { rawDump = !rawDump; Serial.printf("raw dump %s\n", rawDump ? "ON" : "OFF"); }
+    else if (c == 's' || c == 'S') { scanMode = !scanMode; Serial.printf("ADC scan %s\n", scanMode ? "ON" : "OFF"); }
     else if (c == 'h' || c == 'H') printHelp();
+  }
+
+  /* full ADC1 sweep - use this to find which pin a finger actually drives */
+  if (scanMode) {
+    Serial.printf("SCAN 32=%4d 33=%4d 34=%4d 35=%4d 36=%4d 37=%4d 38=%4d 39=%4d\n",
+                  analogRead(32), analogRead(33), analogRead(34), analogRead(35),
+                  analogRead(36), analogRead(37), analogRead(38), analogRead(39));
+    delay(200);
+    return;
   }
 
   if (rawDump) {
