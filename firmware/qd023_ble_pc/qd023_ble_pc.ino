@@ -2,10 +2,11 @@
   QD023 Glove -> PC controller  (v2, calibration rebuilt)
   -------------------------------------------------------
   Reference: ACEBOTT tutorial ACB_Gloves (potentiometer pins + >200 = bent logic)
-  Pin map verified against THIS glove's live readings:
-      Thumb=G36  Index=G39  Middle=G34  Ring=G35  Pinky=G32
-  (G33 was used earlier and is an UNCONNECTED pin on this glove - it idles
-   around 604 and never follows the thumb. The vendor map is the correct one.)
+  Pin map: LEARNED at calibration, not assumed. Each finger's step scans all
+  eight ADC1 pins (G32..G39) and binds whichever one moved furthest from the
+  open-hand baseline, skipping pins already claimed by an earlier finger.
+  This glove does not match the vendor map (Middle sits on G36, not G34), so
+  hardcoding was the source of two wrong mappings already.
 
   Detection model (from the tutorial, made adaptive):
     - tutorial uses a FIXED threshold of 200 with "bent = value above it".
@@ -43,7 +44,13 @@
 
 #define N_FINGERS 5
 
-const int  FINGER_PINS[N_FINGERS]   = {36, 39, 34, 35, 32};
+// Every ADC1 pin on the board. Calibration scans ALL of them for each finger
+// and learns which pin that finger actually drives, so nothing is hardcoded.
+// (This unit does not match the vendor map: Middle lives on G36, not G34.)
+#define ADC_PINS_N 8
+const int ADC_PINS[ADC_PINS_N] = {32, 33, 34, 35, 36, 37, 38, 39};
+
+int FINGER_PINS[N_FINGERS] = {36, 39, 34, 35, 32};   // replaced by calibration
 const char* FINGER_NAMES[N_FINGERS] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
 
 // seeded from the vendor tutorial map (ACB_Gloves: 36/39/34/35/32);
@@ -139,79 +146,69 @@ int bentPct(int i, int raw) {
 
 /* ---------------- calibration ---------------- */
 
-static void sampleOpen(int out[N_FINGERS]) {
-  long sum[N_FINGERS] = {0};
-  const int N = 40;
-  for (int s = 0; s < N; s++) {
-    for (int i = 0; i < N_FINGERS; i++) sum[i] += analogRead(FINGER_PINS[i]);
-    delay(50);
+static void sampleAll(int out[ADC_PINS_N], int samples = 40, int gapMs = 50) {
+  long sum[ADC_PINS_N];
+  for (int i = 0; i < ADC_PINS_N; i++) sum[i] = 0;
+  for (int s = 0; s < samples; s++) {
+    for (int i = 0; i < ADC_PINS_N; i++) sum[i] += analogRead(ADC_PINS[i]);
+    delay(gapMs);
   }
-  for (int i = 0; i < N_FINGERS; i++) out[i] = (int)(sum[i] / N);
+  for (int i = 0; i < ADC_PINS_N; i++) out[i] = (int)(sum[i] / samples);
 }
 
 void doCalibration() {
   Serial.println();
   Serial.println("=== CALIBRATION v" FW_VERSION " (per finger, adaptive) ===");
 
-  /* ---- stage A: OPEN ---- */
+  /* ---- stage A: OPEN baseline on every ADC pin ---- */
   Serial.println("Step 0: hand FLAT and relaxed, fingers STRAIGHT, in 3s...");
   delay(3000);
-  int ext[N_FINGERS];
-  sampleOpen(ext);
-  Serial.printf("OPEN baseline: T=%d I=%d M=%d R=%d P=%d\n",
-                ext[0], ext[1], ext[2], ext[3], ext[4]);
+  int base[ADC_PINS_N];
+  sampleAll(base);
+  Serial.print("OPEN baseline:");
+  for (int p = 0; p < ADC_PINS_N; p++) Serial.printf(" G%d=%d", ADC_PINS[p], base[p]);
+  Serial.println();
 
-  /* ---- stage B: one finger at a time ---- */
+  /* ---- stage B: one finger at a time, DISCOVER its pin ---- */
   for (int f = 0; f < N_FINGERS; f++) {
-    Serial.printf("Step %d/5: bend ONLY %s to a COMFORTABLE position, hold it, in 3s...\n",
-                  f + 1, FINGER_NAMES[f]);
+    Serial.printf("Step %d/5: bend ONLY %s fully, hold it, in 3s...\n", f + 1, FINGER_NAMES[f]);
     delay(3000);
 
-    int mn = 4095, mx = 0;
-    long sum = 0;
-    const int N = 40;
-    for (int s = 0; s < N; s++) {
-      int v = analogRead(FINGER_PINS[f]);
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-      sum += v;
-      if (s % 8 == 0) Serial.printf("   %s = %4d\n", FINGER_NAMES[f], v);
-      delay(50);
-    }
-    int med = (int)(sum / N);
-    int travel = abs(med - ext[f]);
-    int range  = mx - mn;
+    int bent[ADC_PINS_N];
+    sampleAll(bent, 30, 60);
 
-    // A HELD bend has almost no in-window range but a large travel from the
-    // OPEN baseline, so travel is the primary evidence, range only a fallback.
-    // (The old "range < 40" test rejected perfectly good held bends.)
-    if (travel < REST_TRAVEL && range < REST_TRAVEL) {
-      Serial.printf(" %s: NO_TRAVEL (open=%d bent=%d range=%d) -> KEEP_OLD thr=%d %s\n",
-                    FINGER_NAMES[f], ext[f], med, range, thresh[f],
-                    active[f] ? "still-OK" : "still-OFF");
-      Serial.println("   back to FLAT...");
-      delay(1200);
-      continue;
+    // whichever unclaimed ADC pin moved furthest from the OPEN baseline is
+    // this finger's sensor - no pin is assumed, and a pin is used once
+    int bestIdx = -1, bestTravel = 0;
+    for (int p = 0; p < ADC_PINS_N; p++) {
+      bool claimed = false;
+      for (int q = 0; q < f; q++) if (FINGER_PINS[q] == ADC_PINS[p]) claimed = true;
+      if (claimed) continue;
+      int tr = abs(bent[p] - base[p]);
+      if (tr > bestTravel) { bestTravel = tr; bestIdx = p; }
     }
-    if (travel < MIN_TRAVEL && range < MIN_TRAVEL) {
+
+    if (bestIdx < 0 || bestTravel < MIN_TRAVEL) {
       active[f] = false;
-      Serial.printf(" %s: WEAK (travel=%d range=%d) -> marked INACTIVE (bend it fully)\n",
-                    FINGER_NAMES[f], travel, range);
+      Serial.printf(" %s: no pin moved (best travel=%d < %d) -> INACTIVE\n",
+                    FINGER_NAMES[f], bestTravel, MIN_TRAVEL);
       Serial.println("   back to FLAT...");
       delay(1200);
       continue;
     }
 
-    active[f] = true;
-    openVal[f]  = ext[f];
-    fistVal[f]  = med;
+    FINGER_PINS[f] = ADC_PINS[bestIdx];
+    active[f]  = true;
+    openVal[f] = base[bestIdx];
+    fistVal[f] = bent[bestIdx];
 
-    bool inv = (med < ext[f]);          // bent reads BELOW open -> inverted
+    int travel = bestTravel;
+    bool inv = (fistVal[f] < openVal[f]);      // bent reads BELOW open -> inverted
     inverted[f] = inv;
 
     // threshold near the OPEN end, like the tutorial's fixed 200
-    int t = inv ? (ext[f] - (int)((ext[f] - med) * BEND_FRACTION))
-                : (ext[f] + (int)((med - ext[f]) * BEND_FRACTION));
+    int t = inv ? (openVal[f] - (int)((openVal[f] - fistVal[f]) * BEND_FRACTION))
+                : (openVal[f] + (int)((fistVal[f] - openVal[f]) * BEND_FRACTION));
     thresh[f] = t;
 
     int db = travel * 12 / 100;
@@ -219,12 +216,17 @@ void doCalibration() {
     if (db > 60) db = 60;
     deadb[f] = db;
 
-    Serial.printf(" %s: open=%d bent=%d travel=%d thr=%d db=%d %s OK\n",
-                  FINGER_NAMES[f], openVal[f], fistVal[f], travel,
+    Serial.printf(" %s: pin=G%d open=%d bent=%d travel=%d thr=%d db=%d %s OK\n",
+                  FINGER_NAMES[f], FINGER_PINS[f], openVal[f], fistVal[f], travel,
                   thresh[f], deadb[f], inv ? "(bent=LOW)" : "(bent=HIGH)");
     Serial.println("   back to FLAT...");
     delay(1200);
   }
+
+  Serial.print("MAPPING:");
+  for (int f = 0; f < N_FINGERS; f++)
+    Serial.printf(" %s=G%d%s", FINGER_NAMES[f], FINGER_PINS[f], active[f] ? "" : "(off)");
+  Serial.println();
 
   /* ---- stage C: rotation ---- */
   Serial.println("Rotation: hold hand FLAT, PALM towards you, in 3s...");

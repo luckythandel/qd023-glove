@@ -1,6 +1,12 @@
 # Pin map & sensor behaviour
 
-## Wiring (verified against live readings on this glove)
+> **The pin map is learned, not assumed.** Calibration scans all eight ADC1 pins
+> (G32–G39) for each finger and binds whichever one moved most from the open-hand
+> baseline, skipping pins already claimed. This glove does **not** match the vendor
+> map — Middle turned out to sit on G36, not G34 — so any hardcoded table below is
+> just the last observed mapping, and the firmware will correct it.
+
+## Wiring (last observed on this glove)
 
 | Finger | GPIO | ADC1 channel | Rest (straight) | Flexed | Polarity |
 |---|---|---|---|---|---|
