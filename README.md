@@ -34,7 +34,7 @@ qd023-glove/
 | Port | `COM13` @ `115200` |
 | FQBN | `esp32:esp32:esp32` (upload speed `115200`) |
 | IMU | MPU6050 @ `0x68`, SDA `G21`, SCL `G22` |
-| Fingers | Thumb `G33`, Index `G39`, Middle `G34`, Ring `G35`, Pinky `G32` (all ADC1, 12-bit, 11 dB) |
+| Fingers | Thumb `G36`, Index `G39`, Middle `G34`, Ring `G35`, Pinky `G32` (all ADC1, 12-bit, 11 dB) |
 | BLE name | `QD023-Glove` |
 
 ## Quick start

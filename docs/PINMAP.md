@@ -4,7 +4,7 @@
 
 | Finger | GPIO | ADC1 channel | Rest (straight) | Flexed | Polarity |
 |---|---|---|---|---|---|
-| Thumb  | `33` | CH5 | ~608 | ~355 (down to ~22 at full bend) | **bent = LOW** |
+| Thumb  | `36` | CH0 | ~0 | up to ~816 | bent = HIGH |
 | Index  | `39` | CH3 | ~0–40 | ~750 | bent = HIGH |
 | Middle | `34` | CH6 | ~0 | ~530–550 | bent = HIGH |
 | Ring   | `35` | CH7 | ~0 | ~950–1040 | bent = HIGH |
@@ -18,36 +18,45 @@ Configured in firmware:
 ```cpp
 analogReadResolution(12);
 analogSetAttenuation(ADC_11db);
-const int FINGER_PINS[5] = {33, 39, 34, 35, 32};
+const int FINGER_PINS[5] = {36, 39, 34, 35, 32};
 ```
 
-## The G36 question
+## Why the thumb is on G36 (settled)
 
 The vendor tutorial (`docs/reference/ACB_Gloves/ACB_Gloves.h`) declares:
 
 ```cpp
-const int potentiometerPin1 = 36;   // vendor's "thumb"
-const int potentiometerPin2 = 39;
-const int potentiometerPin3 = 34;
-const int potentiometerPin4 = 35;
-const int potentiometerPin5 = 32;
+const int potentiometerPin1 = 36;   // thumb
+const int potentiometerPin2 = 39;   // index
+const int potentiometerPin3 = 34;   // middle
+const int potentiometerPin4 = 35;   // ring
+const int potentiometerPin5 = 32;   // pinky
 ```
 
-But on **this** glove the thumb sensor responds on **G33**: during calibration
-`G33` fell 608 → 12 while the thumb was bent, and `G33` is otherwise rock-steady.
+An early version of this firmware used `G33` for the thumb and `G36` was left as an
+unused "EXTRA_PIN". That was wrong. Measured evidence:
 
-So the firmware uses `G33` for the thumb. To settle it for sure:
+| Test | `G33` | `G36` |
+|---|---|---|
+| Idle (glove worn, fingers straight) | 604 | 0 |
+| Thumb bend only, 150 s | no movement (span 12) | three clear windows, peaks 631 / 816 / 494 |
+| Full finger scan | one 284-count blip (crosstalk) | repeated multi-hundred swings |
 
-1. Start the serial monitor
-2. Send `d` (raw dump on)
-3. Bend **only** the thumb
+`G33` is simply **unconnected** on this glove: it floats at ~604 and only twitches
+with electrical noise. That is what produced the misleading `608 → 12` "calibration"
+reading earlier — a floating pin snapping to ground, not a real bend.
+
+So the thumb is on **G36**, resting at 0 and rising when bent — the same polarity as
+the other four. The firmware no longer hardcodes any polarity; it measures it.
+
+To re-check on the bench: send `d` in the serial monitor. The dump now shows the
+spare pin explicitly:
 
 ```
-RAWS T= 355 I=  40 M=   0 R=   0 P=   0 | G36= 608 (thr ...)
+RAWS T= 612 I=  40 M=   0 R=   0 P=   0 | G33(spare)= 604 (thr T=192 I=289 M=173 R=316 P=265)
 ```
 
-- `T` (G33) moves → current map is correct.
-- `G36` moves → change `FINGER_PINS[0]` to `36` and reflash.
+`T` should track the thumb; `G33` should sit near 604 and never follow it.
 
 ## Detection model
 

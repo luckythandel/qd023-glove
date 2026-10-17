@@ -3,7 +3,9 @@
   -------------------------------------------------------
   Reference: ACEBOTT tutorial ACB_Gloves (potentiometer pins + >200 = bent logic)
   Pin map verified against THIS glove's live readings:
-      Thumb=G33  Index=G39  Middle=G34  Ring=G35  Pinky=G32
+      Thumb=G36  Index=G39  Middle=G34  Ring=G35  Pinky=G32
+  (G33 was used earlier and is an UNCONNECTED pin on this glove - it idles
+   around 604 and never follows the thumb. The vendor map is the correct one.)
 
   Detection model (from the tutorial, made adaptive):
     - tutorial uses a FIXED threshold of 200 with "bent = value above it".
@@ -41,15 +43,16 @@
 
 #define N_FINGERS 5
 
-const int  FINGER_PINS[N_FINGERS]   = {33, 39, 34, 35, 32};
+const int  FINGER_PINS[N_FINGERS]   = {36, 39, 34, 35, 32};
 const char* FINGER_NAMES[N_FINGERS] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
 
-// seeded from the current known-good glove; recalibrated on every boot
-int  openVal[N_FINGERS] = {608,  40,   0,   0,   0};
-int  fistVal[N_FINGERS] = {355, 750, 540, 950, 830};
-int  thresh[N_FINGERS]  = {517, 289, 173, 316, 265};
-int  deadb[N_FINGERS]   = {30,  60,  60,  60,  60};
-bool inverted[N_FINGERS]= {true,false,false,false,false};
+// seeded from the vendor tutorial map (ACB_Gloves: 36/39/34/35/32);
+// recalibrated on every boot. G33 is an unconnected pin on this glove.
+int  openVal[N_FINGERS] = {  0,  40,   0,   0,   0};
+int  fistVal[N_FINGERS] = {600, 750, 540, 950, 830};
+int  thresh[N_FINGERS]  = {192, 289, 173, 316, 265};
+int  deadb[N_FINGERS]   = { 60,  60,  60,  60,  60};
+bool inverted[N_FINGERS]= {false,false,false,false,false};
 bool active[N_FINGERS]  = {true, true, true, true, true};
 
 // fraction of travel from OPEN at which a finger counts as bent.
@@ -323,7 +326,7 @@ void setup() {
 
   Serial.println();
   Serial.println("=== QD023 BLE-PC Controller v" FW_VERSION " ===");
-  Serial.println("pins: T=33 I=39 M=34 R=35 P=32   (ADC1, 12-bit, 11dB)");
+  Serial.println("pins: T=36 I=39 M=34 R=35 P=32   (ADC1, 12-bit, 11dB)");
   printHelp();
 
   analogReadResolution(12);
@@ -389,10 +392,10 @@ void loop() {
   }
 
   if (rawDump) {
-    Serial.printf("RAWS T=%4d I=%4d M=%4d R=%4d P=%4d | G36=%4d (thr T=%d I=%d M=%d R=%d P=%d)\n",
+    Serial.printf("RAWS T=%4d I=%4d M=%4d R=%4d P=%4d | G33(spare)=%4d (thr T=%d I=%d M=%d R=%d P=%d)\n",
                   analogRead(FINGER_PINS[0]), analogRead(FINGER_PINS[1]),
                   analogRead(FINGER_PINS[2]), analogRead(FINGER_PINS[3]),
-                  analogRead(FINGER_PINS[4]), analogRead(36),
+                  analogRead(FINGER_PINS[4]), analogRead(33),
                   thresh[0], thresh[1], thresh[2], thresh[3], thresh[4]);
     delay(250);
     return;
