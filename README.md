@@ -76,6 +76,9 @@ Serial commands: `c` recalibrate · `d` raw pin dump (includes G36) · `h` help.
 Close the serial monitor first (only one program can hold COM13 — the BLE link is separate, so the receiver only needs Bluetooth on).
 
 ```powershell
+# live hand viewer (GUI - see fingers curl, gesture, rotation, twist dial)
+& "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\pc\hand_gui.py"
+
 # prove the wireless link (scan, connect, print messages)
 & "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\tools\ble_probe.py" --seconds 20
 
