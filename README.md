@@ -76,11 +76,20 @@ Serial commands: `c` recalibrate · `d` raw pin dump (includes G36) · `h` help.
 Close the serial monitor first (only one program can hold COM13 — the BLE link is separate, so the receiver only needs Bluetooth on).
 
 ```powershell
+# prove the wireless link (scan, connect, print messages)
+& "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\tools\ble_probe.py" --seconds 20
+
 & "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\pc\pc_receiver.py" --dry-run   # log only
 & "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\pc\pc_receiver.py"             # presentation keys
 & "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\pc\pc_receiver.py" --game      # game keys
 & "C:\Python312\python.exe" "C:\Users\lucky\qd023-glove\pc\pc_simple.py"               # numbers only
 ```
+
+No OS pairing step is needed: the receiver speaks BLE GATT through `bleak`
+(device `QD023-Glove`, address `68:09:47:36:21:92`). If the glove is already
+connected elsewhere it stops advertising, so the receiver falls back to that
+known address. It also **reconnects automatically** every 3 s if the link drops
+(e.g. the glove resets after a reflash).
 
 ## Calibration (runs on every boot)
 

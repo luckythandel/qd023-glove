@@ -12,6 +12,7 @@ import argparse, asyncio, sys
 SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # glove -> PC (notify)
 NAME = "QD023-Glove"
+KNOWN_ADDRESS = "68:09:47:36:21:92"   # fallback when the glove is already connected and not advertising
 
 # Presentation mode: PowerPoint / Chrome / VLC friendly
 PRESENT_MAP = {
@@ -173,13 +174,6 @@ async def main():
     else:
         print("DRY-RUN: no keys will be pressed.")
 
-    print(f"Scanning for {args.name} (BLE on, glove powered, flashed with qd023_ble_pc.ino)...")
-    dev = await BleakScanner.find_device_by_name(args.name, timeout=20)
-    if not dev:
-        print(f"Not found. Check: 1) glove ON + flashed, 2) PC Bluetooth ON, 3) close ACECode/Arduino monitor holding COM13.")
-        sys.exit(2)
-    print(f"Found {dev.address}, connecting...")
-
     def on_rx(sender, data):
         try:
             txt = bytes(data).decode(errors="ignore").strip()
@@ -233,11 +227,37 @@ async def main():
             else:
                 print("BLE:", line)
 
-    async with BleakClient(dev) as cli:
-        print("Connected. Showing gestures - Ctrl+C to quit. Move mouse to corner to abort pyautogui.")
-        await cli.start_notify(TX_UUID, on_rx)
-        while True:
-            await asyncio.sleep(1)
+    # Bluetooth link: connect, serve, and reconnect forever. The glove stops
+    # advertising while connected and resets when reflashed or power-cycled,
+    # so a one-shot connect would leave this app dead.
+    async def connect_and_serve():
+        found = await BleakScanner.find_device_by_name(args.name, timeout=20)
+        if not found:
+            print(f"'{args.name}' not advertising - trying known address {KNOWN_ADDRESS}")
+            addr = KNOWN_ADDRESS
+        else:
+            addr = found if isinstance(found, str) else found.address
+        print(f"Connecting to {addr} ...")
+        async with BleakClient(addr) as cli:
+            print("Connected. Ctrl+C to quit. Move mouse to corner to abort pyautogui.")
+            await cli.start_notify(TX_UUID, on_rx)
+            while cli.is_connected:
+                await asyncio.sleep(1)
+            print("Disconnected.")
 
+    while True:
+        try:
+            await connect_and_serve()
+        except KeyboardInterrupt:
+            print("\nbye")
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"link error: {exc}")
+        print("reconnecting in 3s ...")
+        try:
+            await asyncio.sleep(3)
+        except KeyboardInterrupt:
+            print("\nbye")
+            break
 if __name__ == "__main__":
     asyncio.run(main())
