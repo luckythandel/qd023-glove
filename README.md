@@ -415,3 +415,73 @@ MIT — use, modify, and distribute freely.
 - ESP32 Arduino core: https://github.com/espressif/arduino-esp32
 - bleak (BLE library): https://github.com/hbldh/bleak
 - LEDDMX-03 protocol: Reverse engineered from companion APK
+
+---
+
+## The Diwali Story: How We Reverse-Engineered a Chinese LED Strip (and Got Ready for the Festival of Lights)
+
+Let me tell you how we ended up reverse-engineering a Chinese LED strip controller and why we're going to use it for Diwali. Spoiler: it involved decompiling an Android app and discovering that the original developer had a sense of humor.
+
+### The Problem
+
+The LEDDMX-03 strip came with a companion app. The app worked, but it was a black box. No API, no documentation, no way to automate. You could tap buttons on your phone, but you couldn't script it, integrate it, or control it from your own software. And for Diwali—the festival of lights where you want to create spectacular, synchronized displays—being locked into a phone app is like being asked to conduct an orchestra with a broomstick.
+
+### The Approach: REA (Reverse Engineer Anything)
+
+We didn't try to guess the protocol. We didn't hook up a logic analyzer and stare at waveforms until our eyes bled. We just grabbed the APK from the Play Store and ran it through `jadx`, a Java decompiler. 
+
+What we found was almost comical. The app's code wasn't obfuscated. It was like walking into a library where someone left all the books open on the tables with sticky notes saying "here's the important part."
+
+In `NetConnectBle.java`, we found:
+
+- The exact BLE service UUIDs
+- The characteristic handles for TX and RX
+- A method called `setDirection()` that mapped an integer to a byte
+- A method called `setMusicMicroMode()` that cycled through modes 0-4
+- A method called `setMusicBrightness()` that calculated `value * 32 / 100`
+
+And then we found the crown jewel: `arrays.xml` in the APK resources, containing all 211 LED effect names. Some of these names were... let's just say the original developer had a particular vision:
+
+- "Forward Dreaming" (effect #1)
+- "Backward Horse Race 7 Colors" (effect #81)
+- "Close Curtain Swab CN/VT" (effect #210)
+
+I don't know who "CN/VT" is, but I hope they're okay.
+
+### The Protocol
+
+The LEDDMX-03 uses a 9-byte frame format:
+
+```
+[0x7B] [0xFF] [CMD] [DATA0-4] [0xBF]
+```
+
+We reconstructed the complete command set: power, color, brightness, mode, speed, direction, music-reactive mode, and mic brightness. Every command verified against the original app. 100% behavioral parity.
+
+### Why This Matters for Diwali
+
+Now here's the thing. Diwali is the festival of lights. Millions of diyas, candles, and LED displays illuminate homes, streets, and temples across India. And every year, people buy these pre-programmed LED controllers that do the same blink-and-cycle routine as everyone else's.
+
+We're not doing that this year.
+
+With the QD023 Glove + LEDDMX-03 system, you can control your entire Diwali light display with hand gestures:
+
+- **Open palm** → turn all lights ON
+- **Fist** → turn all lights OFF  
+- **Peace sign** → cycle through lighting modes (static, flowing, strobe, music-reactive)
+- **Thumbs up/down** → adjust brightness
+- **Twist your wrist** → change speed and direction of animations
+
+Imagine standing in your courtyard, waving your hand to create a cascading wave of colors across your entire light installation, synchronized to music playing in the background. No phone app. No remote. Just your hands.
+
+We haven't built the multi-zone controller yet, but the protocol is ready. The firmware supports it. The glove can distinguish between different hand positions and orientations. All that's left is the physical hardware integration and some creative lighting choreography.
+
+### The Bottom Line
+
+We reverse-engineered a proprietary Chinese LED controller not because we wanted to, but because we wanted to. The techniques learned here—APK decompilation, BLE protocol reconstruction, resource extraction—are reusable for any future proprietary device integration.
+
+This Diwali, we're not just decorating. We're conducting.
+
+---
+
+*The LEDDMX-03 protocol analysis was conducted for educational and interoperability purposes. All trademarks and product names belong to their respective owners.*
