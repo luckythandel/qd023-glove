@@ -1,12 +1,14 @@
 # Pin map & sensor behaviour
 
-> **The pin map is learned, not assumed.** Calibration scans all eight ADC1 pins
-> (G32–G39) for each finger and binds whichever one moved most from the open-hand
-> baseline, skipping pins already claimed. This glove does **not** match the vendor
-> map — Middle turned out to sit on G36, not G34 — so any hardcoded table below is
-> just the last observed mapping, and the firmware will correct it.
+> **The pin map is FIXED** (firmware v2.1). It was measured on this unit and matches
+> the vendor tutorial: Thumb=G36, Index=G39, Middle=G34, Ring=G35, Pinky=G32.
+> v2.0 tried to *learn* pins at calibration by scanning G32–G39 per finger, but the
+> unconnected pin G33 (floats ~604, twitches with noise) could win the "biggest
+> mover" contest and bind a finger to noise — that is why some fingers never moved
+> in the GUI. v2.1 trusts the measured map and calibrates only the *thresholds*
+> (two poses: flat hand + fist, median of 40 samples each).
 
-## Wiring (last observed on this glove)
+## Wiring (fixed in firmware, verified on this glove)
 
 | Finger | GPIO | ADC1 channel | Rest (straight) | Flexed | Polarity |
 |---|---|---|---|---|---|
@@ -69,26 +71,36 @@ RAWS T= 612 I=  40 M=   0 R=   0 P=   0 | G33(spare)= 604 (thr T=192 I=289 M=173
 The tutorial uses a single fixed rule: `potValue > 200` means bent. That works
 because those channels rest near 0 and rise well past 500.
 
-This firmware keeps that *shape* but makes it adaptive per finger:
+Firmware v2.1 keeps that *shape* but makes it adaptive per finger, from a
+**two-pose calibration** (hand FLAT then full FIST, each a median of 40 samples):
 
 ```
-threshold = open + 0.32 * (bent - open)      // near the OPEN end, like >200
-deadband  = clamp(0.12 * travel, 15, 60)      // hysteresis either side
-polarity  = auto-detected (bent < open ? inverted : normal)
+threshold = open + bendFraction * (fist - open)  // near the OPEN end, like >200
+deadband  = clamp(0.12 * travel, 15, 60)         // hysteresis either side
+polarity  = auto-detected (fist < open ? inverted : normal)
 ```
 
-Why near the OPEN end rather than the midpoint: with `thr = (open+bent)/2`, Middle
+`bendFraction` defaults to `0.32` and `minTravel` to `80`; both are read from NVS
+(namespace `glove`) at boot and can be changed on the on-board portal. The raw
+`thr[]` values stay calibration-derived — only the *percent* on/off bands are shared
+with the PC bridge.
+
+Why near the OPEN end rather than the midpoint: with `thr = (open+fist)/2`, Middle
 landed at `490 + 48` deadband = `538` while its actual flexed value is `~540`, so it
 flickered. At 32 % of travel the same finger triggers around `173`, which is far
 inside the flexed range.
+
+`bentPct` maps the live ADC to 0–100 % of `fist − open` for the GUI, clamped to
+range. The median sampling rejects single-sample ADC spikes that used to poison
+thresholds (one bad capture gave thumb `thr=794` while the real max is ~816, so the
+thumb never registered as bent).
 
 ### Guard rails
 
 | Condition | Result |
 |---|---|
-| window range < 40 or travel < 60 | `NO_TRAVEL` → keep previous values |
-| travel < 120 | `WEAK` → finger marked inactive |
-| all fingers inactive (< 3 active) | gesture reports `NEED_CALIBRATION` |
+| travel < `minTravel` (default 80) | finger marked `INACTIVE` (thresholds ignored) |
+| < 3 fingers active | gesture reports `NEED_CALIBRATION` |
 
 ## Rotation
 
@@ -138,6 +150,24 @@ accurate across long sessions.
 
 | State | Blink |
 |---|---|
-| No BLE client | 350 ms toggle |
-| BLE connected | 900 ms toggle |
+| No BLE client | `ledFastMs` toggle (default 350 ms) |
+| BLE connected | `ledSlowMs` toggle (default 900 ms) |
 | Gesture fired | 60 ms flash |
+
+Both intervals are configurable on the on-board portal (namespace `glove`).
+
+## Config store (NVS `glove`)
+
+| Key | Default | Effect |
+|---|---|---|
+| `name` | `QD023-Glove` | BLE name **and** AP SSID |
+| `sem` | 600 | `FINGERS:` stream period |
+| `lf` / `ls` | 350 / 900 | LED toggle intervals |
+| `bf` | 0.32 | threshold position between open and fist |
+| `mt` | 80 | below this a finger is `INACTIVE` |
+| `on0`..`on4` / `off0`..`off4` | `56,46,46,46,46` / `30,18,18,18,18` | percent bands shared with the bridge |
+| `tp` / `tr` | 58 / 60 | twist hold-freeze gates, deg/s |
+| `ta` / `ts` | -1 / 0.0 | `-1`/`0.0` = auto from calibration |
+
+`twAxis`/`twSign` default to auto deliberately: a stored axis would override
+calibration and pin the twist to a stale axis after the glove is reworn.

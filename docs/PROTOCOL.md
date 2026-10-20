@@ -59,32 +59,34 @@ TILT_LEFT  TILT_RIGHT  TILT_FWD  TILT_BACK  FLAT
 |---|---|
 | `c` | recalibrate now |
 | `d` | toggle the 5-finger raw dump (incl. spare `G33`) |
-| `s` | toggle full **ADC1 sweep** `32,33,34,35,36,37,38,39` — use to find which pin a finger drives |
+| `s` | toggle ADC1 sweep of the 6 broken-out pins `32,33,34,35,36,39` (G37/G38 absent on WROOM-32D) |
 | `z` | zero the wrist-twist angle |
 | `h` | print help |
 
 ### Output lines
 
 ```
-=== QD023 BLE-PC Controller v2.0 ===
-pins: T=33 I=39 M=34 R=35 P=32   (ADC1, 12-bit, 11dB)
+=== QD023 BLE-PC Controller v2.1 ===
+pins: T=36 I=39 M=34 R=35 P=32   (ADC1, 12-bit, 11dB)
 MPU6050 OK
 BLE advertising as QD023-Glove (NUS)
 
-=== CALIBRATION v2.0 (per finger, adaptive) ===
-Step 0: hand FLAT and relaxed, fingers STRAIGHT, in 3s...
-OPEN baseline: T=608 I=40 M=0 R=0 P=0
-Step 1/5: bend ONLY Thumb to a COMFORTABLE position, hold it, in 3s...
-   Thumb =  603
-   ...
- Thumb: open=608 bent=355 travel=253 thr=527 db=30 (bent=LOW) OK
+=== CALIBRATION v2.1 (two pose: FLAT + FIST) ===
+Step 1/2: hand FLAT, fingers STRAIGHT and relaxed, in 3s...
+OPEN : Thumb=0 Index=40 Middle=0 Ring=0 Pinky=0
+Step 2/2: make a FIST (curl ALL five fingers), hold it, in 3s...
+FIST : Thumb=816 Index=750 Middle=540 Ring=980 Pinky=830
+ Thumb: open=0 fist=816 travel=816 thr=261 db=60 (bent=HIGH) OK
+ Index: open=40 fist=750 travel=710 thr=267 db=60 (bent=HIGH) OK
+ ...
+MAPPING: Thumb=G36 Index=G39 Middle=G34 Ring=G35 Pinky=G32  active=5/5
 
 T:0 I:1 M:0 R:0 P:0  raw[ 355  720  365  417  435]  ONE_FINGER PALM_VIEW
 >>> FINGER:Index:BENT [BLE]
 >>> ONE_FINGER +PALM_VIEW [BLE]
 >>> ROT:PALM_VIEW [BLE]
 
-RAWS T= 355 I=  40 M=   0 R=   0 P=   0 | G36= 608 (thr T=527 I=289 M=173 R=316 P=265)
+RAWS T= 355 I=  40 M=   0 R=   0 P=   0 | G33(spare)= 604 (thr T=261 I=267 M=173 R=316 P=265)
 ```
 
 Suffix `[BLE]` means the message was notified to a connected PC; `[local]` means

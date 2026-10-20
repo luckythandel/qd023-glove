@@ -14,6 +14,7 @@
 param(
     [string]$Port    = "COM13",
     [string]$CliPath = "C:\Users\lucky\arduino-cli\arduino-cli.exe",
+    [string]$Fqbn    = "esp32:esp32:esp32:PartitionScheme=min_spiffs",
     [switch]$SkipCompile
 )
 
@@ -31,7 +32,7 @@ if (-not (Test-Path $CliPath)) {
 
 if (-not $SkipCompile) {
     Write-Host "== compiling ==" -ForegroundColor Cyan
-    & $CliPath compile --fqbn esp32:esp32:esp32 $sketch
+    & $CliPath compile --fqbn $Fqbn $sketch
     if ($LASTEXITCODE -ne 0) {
         Write-Host "compile FAILED" -ForegroundColor Red
         exit 1
@@ -47,7 +48,7 @@ Write-Host ""
 
 for ($i = 1; $i -le 15; $i++) {
     Write-Host "-- attempt $i" -ForegroundColor DarkGray
-    $out = & $CliPath upload -p $Port --fqbn "esp32:esp32:esp32:UploadSpeed=115200" $sketch 2>&1
+    $out = & $CliPath upload -p $Port --fqbn "$Fqbn,UploadSpeed=115200" $sketch 2>&1
     $out | Select-Object -Last 8
 
     if ($out -match "Hash of data verified|Hard resetting") {

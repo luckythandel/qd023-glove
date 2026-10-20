@@ -1,28 +1,34 @@
 /*
-  QD023 Glove -> PC controller  (v2, calibration rebuilt)
-  -------------------------------------------------------
-  Reference: ACEBOTT tutorial ACB_Gloves (potentiometer pins + >200 = bent logic)
-  Pin map: LEARNED at calibration, not assumed. Each finger's step scans all
-  eight ADC1 pins (G32..G39) and binds whichever one moved furthest from the
-  open-hand baseline, skipping pins already claimed by an earlier finger.
-  This glove does not match the vendor map (Middle sits on G36, not G34), so
-  hardcoding was the source of two wrong mappings already.
+  QD023 Glove -> PC controller  (v2.1, two-pose calibration)
+  ----------------------------------------------------------
+  Pin map is FIXED and verified on this unit (docs/PINMAP.md):
+    Thumb=G36 Index=G39 Middle=G34 Ring=G35 Pinky=G32  (all ADC1)
+  G33 is unconnected/floating (~604, twitches with noise) - not a sensor.
+  v2.0 tried to LEARN pins at calibration by scanning G32..G39; floating
+  pins could win the "biggest mover" contest and bind a finger to noise,
+  which left some fingers dead or erratic. v2.1 trusts the measured map.
 
-  Detection model (from the tutorial, made adaptive):
-    - tutorial uses a FIXED threshold of 200 with "bent = value above it".
-      That works because every finger rests near 0 and rises above 500.
-    - here the threshold is placed at ~32% of the measured travel from the
-      OPEN position (not the midpoint), so a light bend already registers,
-      and the whole thing is re-measured for YOUR fingers.
-    - polarity is auto-detected (Thumb reads HIGH when open, LOW when bent;
-      the other four read LOW when open, HIGH when bent). No hardcoding.
+  Calibration is TWO POSES, not five per-finger steps:
+    1. hand flat  -> OPEN baseline (median of 40 samples)
+    2. full fist  -> FIST baseline (median of 40 samples)
+  Median rejects single-sample spikes that used to poison thresholds
+  (one bad capture gave thumb thr=794 while the real max is ~816, so the
+  thumb never registered as bent and the GUI never curled it). Threshold
+  sits at 32% of the measured travel from OPEN - a light bend already
+  registers, like the vendor tutorial's fixed ">200" rule but scaled to
+  YOUR fist. A finger whose fist-open travel is <80 counts is marked
+  inactive instead of feeding garbage to the classifier.
+
+  Detection: polarity auto (bent < open ? inverted : normal), hysteresis
+  deadband = clamp(12% of travel, 15, 60). bentPct maps raw to 0..100%
+  of travel for the GUI.
 
   BLE (Nordic UART Service) - unchanged, so pc_receiver.py still works:
     Service 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
     TX  6E400003-...  notify (glove -> PC)
     RX  6E400002-...  write  (PC -> glove, "CAL" = recalibrate)
-  Messages: READY / GESTURE: / FINGERS: / FINGER:<name>:BENT|EXT / ROT:
-  Serial: 'c' recalibrate, 'd' toggle raw pin diagnostics, 'h' help
+  Messages: READY / GESTURE: / FINGERS: / FINGER:<name>:BENT|EXT / ROT: / TWIST: / SWEEP:
+  Serial: 'c' recalibrate, 'd' raw pin dump, 's' ADC1 scan, 'z' zero twist+sweep, 'h' help
 */
 
 #include <Wire.h>
@@ -30,10 +36,64 @@
 #include <Adafruit_Sensor.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
+#include <BLEClient.h>
+#include <BLEScan.h>
+#include <BLERemoteService.h>
+#include <BLERemoteCharacteristic.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "cfg_store.h"
 
-#define FW_VERSION "2.0"
+#define FW_VERSION "3.2"
+
+// K1 user button. Discovered empirically with the fw 2.7 pin scanner: a K1
+// press latched "P23" edges (BOOT/GPIO0 stayed silent), so K1 is wired to
+// GPIO23 - a normal GPIO, NOT the strap pin. BOOT is a separate button on
+// GPIO0. Held LOW (button down) with an internal pull-up.
+#define K1_PIN          23
+#define K1_DEBOUNCE_MS  60
+
+/* ---- K1 pin discovery scanner (diagnostic, fw 2.7) ----
+ * Vendor docs never state which GPIO the K1 user button uses. All plausible
+ * spare pins are sampled with internal pull-ups; every edge is latched into
+ * g_scanHit (exposed via /api/status "scanhit") and printed to Serial.
+ * BOOT(GPIO0) is included as a control: pressing BOOT must show P0 edges,
+ * proving the scanner works while proving K1 is NOT on GPIO0.
+ * Strapping pins (0/2/12/15) get their pull-ups at runtime only - never hold
+ * a button across a power cycle while this build is running.
+ */
+static const uint8_t K1_SCAN_PINS[] = {0, 2, 4, 5, 12, 13, 14, 15, 16, 18, 19, 23, 25, 26, 27, 33};
+static const int     K1_SCAN_N      = (int)(sizeof(K1_SCAN_PINS) / sizeof(K1_SCAN_PINS[0]));
+static uint8_t       g_scanPrev[16];
+char                 g_scanHit[32] = "";
+
+static void k1ScanSetup() {
+  for (int i = 0; i < K1_SCAN_N; i++) {
+    pinMode(K1_SCAN_PINS[i], INPUT_PULLUP);
+    g_scanPrev[i] = digitalRead(K1_SCAN_PINS[i]);
+  }
+  Serial.println("K1SCAN active - press K1 (or BOOT); edges -> serial + /api/status scanhit");
+}
+
+static void k1ScanPoll() {
+  for (int i = 0; i < K1_SCAN_N; i++) {
+    uint8_t s = digitalRead(K1_SCAN_PINS[i]);
+    if (s != g_scanPrev[i]) {
+      g_scanPrev[i] = s;
+      snprintf(g_scanHit, sizeof(g_scanHit), "P%d:%s@%lus",
+               K1_SCAN_PINS[i], s == LOW ? "DN" : "UP", millis() / 1000UL);
+      Serial.printf("K1SCAN %s\n", g_scanHit);
+    }
+  }
+}
+
+// Onboard status LED. The vendor's own QD023 firmware (02Gloves.ino) drives
+// GPIO17: pinMode(17, OUTPUT), digitalWrite(17, LOW) = LED ON, so the
+// indicator is on GPIO17 and is ACTIVE-LOW. GPIO2 has nothing connected on
+// this carrier. All writes below must use LOW for "lit" / HIGH for "dark".
+#define LED_BUILTIN     17
 
 #define DEVICE_NAME "QD023-Glove"
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -44,17 +104,15 @@
 
 #define N_FINGERS 5
 
-// Every ADC1 pin on the board. Calibration scans ALL of them for each finger
-// and learns which pin that finger actually drives, so nothing is hardcoded.
-// (This unit does not match the vendor map: Middle lives on G36, not G34.)
-#define ADC_PINS_N 8
-const int ADC_PINS[ADC_PINS_N] = {32, 33, 34, 35, 36, 37, 38, 39};
-
-int FINGER_PINS[N_FINGERS] = {36, 39, 34, 35, 32};   // replaced by calibration
+// Fixed pin map, measured on THIS unit (see docs/PINMAP.md).
+// Thumb=G36 Index=G39 Middle=G34 Ring=G35 Pinky=G32 - all ADC1 (safe with BLE).
+// G33 is unconnected on this glove and floats ~604; G37/G38 are not broken out
+// on the WROOM-32D module. v2.0 scanned these during calibration and could
+// bind a finger to noise - that is why some fingers never moved in the GUI.
+const int FINGER_PINS[N_FINGERS] = {36, 39, 34, 35, 32};
 const char* FINGER_NAMES[N_FINGERS] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
 
-// seeded from the vendor tutorial map (ACB_Gloves: 36/39/34/35/32);
-// recalibrated on every boot. G33 is an unconnected pin on this glove.
+// overwritten by the two-pose calibration on every boot (seeded with last-good values)
 int  openVal[N_FINGERS] = {  0,  40,   0,   0,   0};
 int  fistVal[N_FINGERS] = {600, 750, 540, 950, 830};
 int  thresh[N_FINGERS]  = {192, 289, 173, 316, 265};
@@ -66,7 +124,6 @@ bool active[N_FINGERS]  = {true, true, true, true, true};
 // tutorial's fixed 200 on a 0..1000 swing is ~20-35% -> this matches it.
 #define BEND_FRACTION 0.32f
 #define MIN_TRAVEL    80      // below this the finger is ignored as unusable
-#define REST_TRAVEL   60      // tutorial's "NO_TRAVEL" guard for empty runs
 
 /* ---------------- rotation ---------------- */
 
@@ -81,6 +138,315 @@ int   twistAxis   = 2;        // 0=x 1=y 2=z, chosen during calibration
 float twistSign   = 1.0f;     // flips the axis so CLOCKWISE is positive
 float gyroBias[3] = {0, 0, 0};
 float twistAngle  = 0.0f;     // degrees since the last zero
+float sweepAngle  = 0.0f;     // lateral-hand yaw sweep: degrees since last zero
+
+/* ---- calibration live status (for web panel animation) ---- */
+enum CalState { CAL_IDLE, CAL_FLAT, CAL_FIST, CAL_ROTATE_PALM, CAL_ROTATE_BACK, CAL_STILL, CAL_TWIST, CAL_DONE };
+CalState g_calState = CAL_IDLE;
+unsigned long g_calStepStartMs = 0;
+unsigned long g_calStepDurationMs = 0;
+const char* g_calStepName = "Idle";
+
+/* ---------------- LED strip mode ----------------
+   The strip is NOT wired to the glove. It is a separate ESP32 running
+   Downloads/glove/ESP32_BLE_LED_Controller.ino, which advertises service
+   0xFFE0 and renders effects from command frames written to char 0xFFE1
+   (protocol recovered from the "ledble" app inside base.apk). The glove
+   plays the app's role over BLE: scan -> connect -> push state frames.
+   Effects are rendered strip-side, so the glove only transmits state
+   changes (power / color+brightness / mode / speed). The control surface
+   is unchanged: portal /api/led, serial LEDx: commands, gestures, K1. */
+#define CTL_WINDOWS 0
+#define CTL_LED     1
+int gCtlMode = CTL_WINDOWS;
+
+bool    ledPower  = false;
+uint8_t ledBright = 60;   // 0-100
+uint8_t ledR = 255, ledG = 255, ledB = 255;
+uint8_t ledMode  = 0;     // 0 solid 1 breathe 2 flash 3 twinkle 4 stars 5 gradient
+uint8_t ledSpeed = 50;    // 0-100
+uint8_t ledRawMode = 0;   // raw DMX effect code from the portal dropdown (0 = glove modes 0-5)
+uint8_t ledDir    = 0;    // effect direction: 0 forward, 1 backward (re-sent on each sync)
+char    g_lastGesture[20] = ""; // last classified pose: /api/status + gestures page
+static uint8_t ledPresetIdx = 0;
+static const uint8_t LED_PRESETS[7][3] = {
+  {255,255,255},{255,0,0},{0,255,0},{0,0,255},{255,255,0},{0,255,255},{255,0,255}
+};
+
+static bool g_ledDirty = false;
+bool g_stripLink = false;         // wireless strip BLE link (exposed via /api/status)
+
+/* Commit point for every LED state change (portal /api/led, serial LEDx:
+   commands, gestures). The strip is wireless: instead of PWM we mark the
+   state dirty and stripPoll() pushes the frames to the strip over BLE. */
+static void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
+  (void)r; (void)g; (void)b;      // callers already updated the state vars
+  g_ledDirty = true;
+}
+
+static void ledSetHue(int h) {                  // HSV S=1 V=1 -> RGB
+  h = ((h % 360) + 360) % 360;
+  float f = (h % 60) / 60.0f;
+  uint8_t r = 0, g = 0, b = 0;
+  switch ((h / 60) % 6) {
+    case 0: r = 255; g = (uint8_t)(255 * f); break;
+    case 1: r = (uint8_t)(255 * (1 - f)); g = 255; break;
+    case 2: g = 255; b = (uint8_t)(255 * f); break;
+    case 3: g = (uint8_t)(255 * (1 - f)); b = 255; break;
+    case 4: r = (uint8_t)(255 * f); b = 255; break;
+    default: r = 255; b = (uint8_t)(255 * (1 - f)); break;
+  }
+  ledR = r; ledG = g; ledB = b;
+  ledMode = 0;                                  // hue set -> solid color
+  ledWrite(r, g, b);
+}
+
+static int ledClamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* signed "+10"/"-10" steps or absolute values, clamped */
+static int ledParseStep(const String& s, int cur, int lo, int hi) {
+  int v = (s.startsWith("+") || s.startsWith("-")) ? cur + s.toInt() : s.toInt();
+  return ledClamp(v, lo, hi);
+}
+
+/* Gesture -> LED action map (fw 3.2), active only in LED control mode (the
+   caller checks gCtlMode). Discrete pose -> discrete change; the wrist twist
+   acts as a speed dial separately in loop(). Every action flips state and
+   marks it dirty; stripPoll() pushes the frames to the wireless strip (or
+   holds them until the link comes back up). Unknown poses are ignored. */
+static void ledGestureAction(const String& g) {
+  if (g == "OPEN_PALM")      ledPower = true;
+  else if (g == "FIST")      ledPower = false;
+  else if (g == "PEACE")     { ledMode = (ledMode + 1) % 6; ledRawMode = 0; }
+  else if (g == "INDEX_UP") {
+    ledPresetIdx = (ledPresetIdx + 1) % 7;
+    ledR = LED_PRESETS[ledPresetIdx][0];
+    ledG = LED_PRESETS[ledPresetIdx][1];
+    ledB = LED_PRESETS[ledPresetIdx][2];
+    ledMode = 0; ledRawMode = 0;    // explicit color -> solid
+  }
+  else if (g == "THUMBS_UP") ledBright = (uint8_t)ledClamp((int)ledBright + 25, 0, 100);
+  else if (g == "PINKY_UP")  ledBright = (uint8_t)ledClamp((int)ledBright - 25, 0, 100);
+  else return;
+  ledWrite(ledR, ledG, ledB);
+}
+
+/* ---- wireless LED strip link (fw 3.1) ----
+   The glove plays the "ledble" Android app's role (protocol recovered from
+   base.apk, com.home.net.NetConnectBle). The user's strip advertises as
+   "LEDDMX-03-..." - the DMX variant: 9-byte frames written to char 0xFFE1
+   (service 0xFFE0), prefix 0x7B, terminator 0xBF:
+     power   7B 04 04 01|00 FF FF FF FF BF
+     bright  7B FF 01 (B*32/100) B 00 FF FF BF   B = 0-100
+     color   7B FF 07 R   G   B   FF FF BF       (static color = "solid")
+     mode    7B FF 03 M   FF FF FF FF BF         M = effect code (dmx_model)
+     speed   7B FF 02 S   FF 00 FF FF BF         S = 1-100
+   Effects render strip-side; the glove only pushes state changes. */
+#define STRIP_SVC_UUID   0xFFE0
+#define STRIP_CHAR_UUID  0xFFE1
+
+enum StripState { STRIP_IDLE, STRIP_SCANNING, STRIP_CONNECTING, STRIP_CONNECTED };
+StripState           g_stripState = STRIP_IDLE;   // enum in web_portal.h
+uint8_t              g_stripFails = 0;            // connect-fail/drop counter: /api/status
+static unsigned long g_stripScanStart = 0;
+static unsigned long g_stripRetryAt = 0;
+static bool          g_stripFound = false;
+static BLEAddress    g_stripAddr;
+static BLEClient*    g_stripClient = nullptr;
+static BLERemoteCharacteristic* g_stripChar = nullptr;
+char g_stripName[24] = "";        // advertised name (variant check), /api/status
+
+/* glove mode 0-5 -> DMX effect codes (R.array.dmx03_model in the app,
+   verified live on the LEDDMX-03 strip):
+   0 solid = color frame only; 1 Horse Race 7 Colors; 2 Hop RD/GN/BU;
+   3 Forward Flutter CN/VT/WH; 4 Forward Dreaming; 5 Forward Streaming 7 Colors */
+static const uint8_t STRIP_MODE_MAP[6] = { 0, 81, 78, 75, 1, 39 };
+
+static void stripWrite9(const uint8_t* f) {
+  if (g_stripState != STRIP_CONNECTED || !g_stripClient || !g_stripChar) return;
+  g_stripChar->writeValue((uint8_t*)f, 9);
+  delay(30);                      // app throttles ~30-50 ms between frames
+}
+
+static void stripPowerFrame(bool on) {
+  uint8_t f[9] = { 0x7B, 0x04, 0x04, on ? 0x01 : 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+static void stripPowerOff() { stripPowerFrame(false); }
+
+static void stripBrightFrame(uint8_t b) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x01, (uint8_t)((b * 32) / 100), b, 0x00, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+static void stripColorFrame(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x07, r, g, b, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+static void stripModeFrame(uint8_t code) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x03, code, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+static void stripSpeedFrame(uint8_t s) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x02, s, 0xFF, 0x00, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+/* Effect direction (NetConnectBle.setDirection, LEDDMX-03 branch):
+   7B FF 0D D FF FF FF FF BF - D 0 forward, 1 backward. */
+static void stripDirectionFrame(uint8_t d) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x0D, d, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+/* Mic/voice-reactive effect (setMusicMicroMode / setVoiceCtlMode, LEDDMX-03):
+   7B FF 0B M V FF FF FF BF - M 0-4 (gradual/trailing/jump/strobe/off),
+   V 1 = microphone on. One-shot poke: mic effects are strip-side state, so
+   they must NOT go through the dirty-sync path (a full sync would overwrite
+   the mic effect with color/mode frames). */
+static void stripMusicFrame(uint8_t m, uint8_t voice) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x0B, m, voice, 0xFF, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+/* Music-mode brightness (setMusicBrightness, LEDDMX-03): like stripBrightFrame
+   but with the voice flag (byte 5) = 1. One-shot poke, same reason. */
+static void stripMusicBrightFrame(uint8_t b) {
+  uint8_t f[9] = { 0x7B, 0xFF, 0x01, (uint8_t)((b * 32) / 100), b, 0x01, 0xFF, 0xFF, 0xBF };
+  stripWrite9(f);
+}
+
+static void stripSyncAll() {     // color first: it forces static mode
+  stripPowerFrame(ledPower);
+  if (!ledPower) return;
+  stripBrightFrame(ledBright);
+  stripColorFrame(ledR, ledG, ledB);
+  if (ledRawMode) stripModeFrame(ledRawMode);   // portal dropdown pick (raw DMX code)
+  else if (ledMode > 0) stripModeFrame(STRIP_MODE_MAP[ledMode]);
+  stripDirectionFrame(ledDir);                  // forward/backward persists strip-side
+  stripSpeedFrame(ledSpeed < 1 ? 1 : ledSpeed);
+}
+
+class StripScanCB : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    BLEUUID svc((uint16_t)STRIP_SVC_UUID);
+    String nm = advertisedDevice.getName();
+    bool bySvc  = advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(svc);
+    bool byName = nm.startsWith("LED") || nm.startsWith("BED");  // app filter: NAME_START_LED/BED
+    if (bySvc || byName) {
+      g_stripAddr = advertisedDevice.getAddress();
+      g_stripFound = true;          // stripPoll stops the scan + transitions
+      strlcpy(g_stripName, nm.c_str(), sizeof(g_stripName));
+      Serial.printf("STRIP: found %s %s\n", g_stripName, g_stripAddr.toString().c_str());
+    }
+  }
+};
+
+static StripScanCB g_stripScanCB;
+
+static void scanCompleteCB(BLEScanResults results) {
+  (void)results;
+  if (g_stripState != STRIP_SCANNING) return;
+  if (g_stripFound) {
+    g_stripState = STRIP_CONNECTING;
+  } else {
+    g_stripState = STRIP_IDLE;
+    g_stripRetryAt = millis() + 10000;
+  }
+}
+
+class StripClientCB : public BLEClientCallbacks {
+  void onDisconnect(BLEClient* c) override {
+    (void)c;
+    g_stripState = STRIP_IDLE;
+    g_stripRetryAt = millis() + 3000;
+    g_stripChar = nullptr;
+    g_stripLink = false;
+    g_stripFails++;
+    Serial.println("STRIP: link lost - rescanning");
+  }
+};
+
+static StripClientCB g_stripClientCB;
+
+/* Connection state machine + dirty-state push, run from loop() while the
+   glove is in LED control mode. connect() blocks ~1 s per attempt. */
+static void stripPoll() {
+  if (gCtlMode != CTL_LED) return;
+  switch (g_stripState) {
+    case STRIP_IDLE:
+      if (g_stripClient) {          // stale client from a dropped link
+        delete g_stripClient;
+        g_stripClient = nullptr;
+        g_stripChar = nullptr;
+      }
+      if ((long)(millis() - g_stripRetryAt) >= 0) {
+        g_stripFound = false;
+        BLEScan* scan = BLEDevice::getScan();
+        scan->setAdvertisedDeviceCallbacks(&g_stripScanCB, false);
+        scan->setActiveScan(true);
+        scan->clearResults();
+        scan->start(3, scanCompleteCB, false);
+        g_stripScanStart = millis();
+        g_stripState = STRIP_SCANNING;
+        Serial.println("STRIP: scanning for 0xFFE0 advertiser");
+      }
+      break;
+    case STRIP_SCANNING:
+      if (g_stripFound) {           // matched in onResult; stop from main loop
+        BLEDevice::getScan()->stop();
+        g_stripState = STRIP_CONNECTING;
+      } else if ((long)(millis() - g_stripScanStart) >= 3500) {
+        g_stripState = STRIP_IDLE;  // scan window elapsed, nothing matched
+        g_stripRetryAt = millis() + 10000;
+      }
+      break;
+    case STRIP_CONNECTING: {
+      delay(100);                 // let the scan controller fully release
+      g_stripClient = BLEDevice::createClient();
+      g_stripClient->setClientCallbacks(&g_stripClientCB);
+      if (!g_stripClient->connect(g_stripAddr)) {
+        Serial.println("STRIP: connect failed");
+        g_stripFails++;
+        delete g_stripClient;
+        g_stripClient = nullptr;
+        g_stripState = STRIP_IDLE;
+        g_stripRetryAt = millis() + 10000;
+        break;
+      }
+      BLERemoteService* svc = g_stripClient->getService(BLEUUID((uint16_t)STRIP_SVC_UUID));
+      g_stripChar = svc ? svc->getCharacteristic(BLEUUID((uint16_t)STRIP_CHAR_UUID)) : nullptr;
+      if (!g_stripChar) {
+        Serial.println("STRIP: 0xFFE1 characteristic missing");
+        g_stripFails++;
+        g_stripClient->disconnect();
+        delete g_stripClient;
+        g_stripClient = nullptr;
+        g_stripState = STRIP_IDLE;
+        g_stripRetryAt = millis() + 10000;
+        break;
+      }
+      g_stripState = STRIP_CONNECTED;
+      g_stripLink = true;
+      Serial.println("STRIP: connected - pushing state");
+      g_ledDirty = true;
+      break;
+    }
+    case STRIP_CONNECTED:
+      if (g_ledDirty) {
+        g_ledDirty = false;
+        stripSyncAll();
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static void setCtlMode(int m);
 
 Adafruit_MPU6050 mpu;
 bool mpuOK = false;
@@ -93,6 +459,14 @@ bool bleConnected = false;
 
 void doCalibration();
 void printHelp();
+static void cfgRxLine(const String& v);
+static void k1Service();
+
+#include "web_portal.h"
+
+static String g_wsBuf;
+static int    g_wsSeen = 0;
+static int    g_wsTot  = 0;
 
 class ServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
@@ -112,6 +486,7 @@ class RxCB : public BLECharacteristicCallbacks {
     v.trim();
     Serial.println("BLE RX: " + v);
     if (v.equalsIgnoreCase("CAL")) doCalibration();
+    else cfgRxLine(v);
   }
 };
 
@@ -122,23 +497,199 @@ void bleSend(const String& s) {
   }
 }
 
-/* ---------------- helpers ---------------- */
-
-int readAvg(int pin, int n = 10) {
-  long s = 0;
-  for (int k = 0; k < n; k++) { s += analogRead(pin); delay(3); }
-  return (int)(s / n);
+/* control-mode switch: 0 = WINDOWS (media keys), 1 = LED strip. Notifies the
+   bridge ("MOD:x") so it can reroute gestures. Leaving LED mode powers the
+   wireless strip off immediately; entering it re-syncs the full state once
+   the strip link is up. */
+static void setCtlMode(int m) {
+  if (m != CTL_WINDOWS && m != CTL_LED) return;
+  if (m == gCtlMode) return;
+  int prev = gCtlMode;
+  gCtlMode = m;
+  if (prev == CTL_LED) stripPowerOff();
+  g_ledDirty = true;
+  bleSend(String("MOD:") + m + "\n");
+  Serial.printf("mode: %s\n", m == CTL_LED ? "LED STRIP" : "WINDOWS");
 }
 
-int lean(int lo, int hi, int pct) { return lo + (hi - lo) * pct / 100; }
+// The PC bridge pulls the shared thresholds after it subscribes, and pushes
+// them back when the UI changes one. Short lines keep every notify inside the
+// smallest common ATT payload (20 bytes at the default MTU).
+static bool parseCsv5(const String& s, uint8_t out[5]) {
+  int start = 0;
+  for (int i = 0; i < 5; i++) {
+    int comma = s.indexOf(',', start);
+    String tok = (comma < 0) ? s.substring(start) : s.substring(start, comma);
+    long v = tok.toInt();
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    out[i] = (uint8_t)v;
+    if (comma < 0) return i == 4;
+    start = comma + 1;
+  }
+  return true;
+}
 
-// 0..100 = how far this finger has travelled from OPEN towards FIST,
-// clamped so a value sitting on either end never goes out of range.
+static void cfgRxLine(const String& v) {
+  // WiFi credentials do not fit one 20-byte notify, so they arrive as ordered
+  // fragments: "WS:1/4:<text>" ... "WS:4/4:<text>". Reassembly is staged and
+  // only committed once the last fragment lands and the count matches.
+  if (v.startsWith("WS:")) {
+    int a = v.indexOf(':', 3);
+    int b = v.indexOf('/', 3);
+    if (a < 0 || b < 0 || b > a) { bleSend("ERR:WSFMT\n"); return; }
+    int idx = v.substring(3, b).toInt();
+    int tot = v.substring(b + 1, a).toInt();
+    String part = v.substring(a + 1);
+    if (idx < 1 || tot < 1 || tot > 8 || idx > tot) { bleSend("ERR:WSFMT\n"); return; }
+    if (idx == 1) { g_wsBuf = ""; g_wsTot = tot; }
+    if (idx != g_wsSeen + 1) { bleSend("ERR:WSSEQ\n"); g_wsSeen = 0; return; }
+    g_wsBuf += part;
+    g_wsSeen = idx;
+    if (idx < tot) { bleSend("OK:WS" + String(idx) + "\n"); return; }
+    g_wsSeen = 0;
+
+    int sep = g_wsBuf.indexOf('\n');
+    if (sep < 0) { bleSend("ERR:WSCFG\n"); return; }
+    String ssid = g_wsBuf.substring(0, sep);
+    String pass = g_wsBuf.substring(sep + 1);
+    if (ssid.length() == 0 || ssid.length() > 32) { bleSend("ERR:WSSSID\n"); return; }
+    if (pass.length() > 63) { bleSend("ERR:WSPASS\n"); return; }
+
+    strncpy(g_cfg.wifiSsid, ssid.c_str(), sizeof(g_cfg.wifiSsid) - 1);
+    g_cfg.wifiSsid[sizeof(g_cfg.wifiSsid) - 1] = '\0';
+    strncpy(g_cfg.wifiPass, pass.c_str(), sizeof(g_cfg.wifiPass) - 1);
+    g_cfg.wifiPass[sizeof(g_cfg.wifiPass) - 1] = '\0';
+    g_cfg.wifiEn = true;
+    cfgSave(g_cfg);
+    bleSend("OK:WS\n");
+    wifiRequestJoin(g_cfg.wifiSsid, g_cfg.wifiPass);
+    return;
+  }
+  if (v.equalsIgnoreCase("WIFISTAT")) {
+    bleSend("WST:" + String(g_wifiState) + "," +
+            (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("-")) + "\n");
+    return;
+  }
+  if (v.equalsIgnoreCase("GETCFG")) {    char b[40];
+    snprintf(b, sizeof(b), "THR:%u,%u,%u,%u,%u\n",
+             g_cfg.onPct[0], g_cfg.onPct[1], g_cfg.onPct[2],
+             g_cfg.onPct[3], g_cfg.onPct[4]);
+    bleSend(String(b)); delay(20);
+    snprintf(b, sizeof(b), "THO:%u,%u,%u,%u,%u\n",
+             g_cfg.offPct[0], g_cfg.offPct[1], g_cfg.offPct[2],
+             g_cfg.offPct[3], g_cfg.offPct[4]);
+    bleSend(String(b)); delay(20);
+    snprintf(b, sizeof(b), "TWD:%.1f,%.1f\n", g_cfg.twistPauseDps, g_cfg.twistResumeDps);
+    bleSend(String(b));
+    return;
+  }
+  if (v.startsWith("SO:")) {
+    parseCsv5(v.substring(3), g_cfg.onPct);
+    cfgSave(g_cfg);
+    bleSend("OK:SO\n");
+  } else if (v.startsWith("SF:")) {
+    parseCsv5(v.substring(3), g_cfg.offPct);
+    cfgSave(g_cfg);
+    bleSend("OK:SF\n");
+  } else if (v.startsWith("ST:")) {
+    int c = v.indexOf(',', 3);
+    if (c > 0) {
+      g_cfg.twistPauseDps  = v.substring(3, c).toFloat();
+      g_cfg.twistResumeDps = v.substring(c + 1).toFloat();
+      cfgSave(g_cfg);
+      bleSend("OK:ST\n");
+    }
+  } else if (v.startsWith("LEDP:")) {
+    String a = v.substring(5);
+    if (a == "T") ledPower = !ledPower;
+    else ledPower = (a == "1");
+    ledWrite(ledR, ledG, ledB);
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("LEDC:")) {
+    String a = v.substring(5);
+    if (a == "cycle") {
+      ledPresetIdx = (ledPresetIdx + 1) % 7;
+      ledR = LED_PRESETS[ledPresetIdx][0];
+      ledG = LED_PRESETS[ledPresetIdx][1];
+      ledB = LED_PRESETS[ledPresetIdx][2];
+    } else {
+      int c1 = a.indexOf(',');
+      int c2 = a.indexOf(',', c1 + 1);
+      if (c1 > 0 && c2 > c1) {
+        ledR = (uint8_t)ledClamp(a.substring(0, c1).toInt(), 0, 255);
+        ledG = (uint8_t)ledClamp(a.substring(c1 + 1, c2).toInt(), 0, 255);
+        ledB = (uint8_t)ledClamp(a.substring(c2 + 1).toInt(), 0, 255);
+      }
+    }
+    ledMode = 0;                       // explicit color -> solid
+    ledRawMode = 0;
+    ledWrite(ledR, ledG, ledB);
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("LEDB:")) {
+    ledBright = (uint8_t)ledParseStep(v.substring(5), ledBright, 0, 100);
+    ledWrite(ledR, ledG, ledB);
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("LEDM:")) {
+    String a = v.substring(5);
+    int m;
+    if (a.startsWith("+") || a.startsWith("-")) {
+      m = ((int)ledMode + a.toInt()) % 6;   // relative steps wrap 0..5
+      if (m < 0) m += 6;
+    } else {
+      m = ledClamp(a.toInt(), 0, 5);        // absolute: clamp
+    }
+    ledMode = (uint8_t)m;
+    ledRawMode = 0;
+    ledWrite(ledR, ledG, ledB);
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("LEDS:")) {
+    ledSpeed = (uint8_t)ledParseStep(v.substring(5), ledSpeed, 0, 100);
+    ledWrite(ledR, ledG, ledB);
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("LEDH:")) {
+    ledSetHue(v.substring(5).toInt());
+    ledRawMode = 0;
+    bleSend("OK:LED\n");
+  } else if (v.startsWith("MOD:")) {
+    setCtlMode(v.substring(4).toInt());
+  } else if (v.equalsIgnoreCase("GETMODE")) {
+    bleSend("MOD:" + String(gCtlMode) + "\n");
+  }
+}
+
+/* ---------------- helpers ---------------- */
+
+// insertion-sort median over `n` samples; rejects single-sample ADC spikes
+// (one bad sample used to poison a finger's threshold and dead-band)
+static int medianOf(int* buf, int n) {
+  for (int i = 1; i < n; i++) {
+    int key = buf[i], j = i - 1;
+    while (j >= 0 && buf[j] > key) { buf[j + 1] = buf[j]; j--; }
+    buf[j + 1] = key;
+  }
+  return (n & 1) ? buf[n / 2] : (buf[n / 2 - 1] + buf[n / 2]) / 2;
+}
+
+// median of all five fingers at once (hand FLAT or FIST pose)
+static void capturePose(int out[N_FINGERS], int samples = 40, int gapMs = 50) {
+  static int buf[N_FINGERS][64];
+  if (samples > 64) samples = 64;
+  for (int s = 0; s < samples; s++) {
+    for (int i = 0; i < N_FINGERS; i++) buf[i][s] = analogRead(FINGER_PINS[i]);
+    delay(gapMs);
+  }
+  for (int i = 0; i < N_FINGERS; i++) out[i] = medianOf(buf[i], samples);
+}
+
+// 0..100 = how far this finger has travelled from OPEN towards FIST.
+// v2.1 fix: span = fist - open so an inverted finger (bent reads LOW)
+// still maps open->0 and fist->100. The v2.0 a/b swap reversed the
+// scale for inverted fingers in the GUI.
 int bentPct(int i, int raw) {
-  int a = inverted[i] ? fistVal[i] : openVal[i];
-  int b = inverted[i] ? openVal[i] : fistVal[i];
-  if (b <= a) return 0;
-  int p = (raw - a) * 100 / (b - a);
+  int span = fistVal[i] - openVal[i];
+  if (span == 0) return 0;
+  int p = (raw - openVal[i]) * 100 / span;
   if (p < 0) p = 0;
   if (p > 100) p = 100;
   return p;
@@ -146,91 +697,84 @@ int bentPct(int i, int raw) {
 
 /* ---------------- calibration ---------------- */
 
-static void sampleAll(int out[ADC_PINS_N], int samples = 40, int gapMs = 50) {
-  long sum[ADC_PINS_N];
-  for (int i = 0; i < ADC_PINS_N; i++) sum[i] = 0;
-  for (int s = 0; s < samples; s++) {
-    for (int i = 0; i < ADC_PINS_N; i++) sum[i] += analogRead(ADC_PINS[i]);
-    delay(gapMs);
-  }
-  for (int i = 0; i < ADC_PINS_N; i++) out[i] = (int)(sum[i] / samples);
-}
-
 void doCalibration() {
   Serial.println();
-  Serial.println("=== CALIBRATION v" FW_VERSION " (per finger, adaptive) ===");
+  Serial.println("=== CALIBRATION v" FW_VERSION " (two pose: FLAT + FIST) ===");
 
-  /* ---- stage A: OPEN baseline on every ADC pin ---- */
-  Serial.println("Step 0: hand FLAT and relaxed, fingers STRAIGHT, in 3s...");
+  /* ---- stage A: OPEN baseline (all five fingers straight) ---- */
+  g_calState = CAL_FLAT;
+  g_calStepStartMs = millis();
+  g_calStepDurationMs = 3000;
+  g_calStepName = "Hold hand FLAT, fingers straight and relaxed";
+  Serial.println("Step 1/2: hand FLAT, fingers STRAIGHT and relaxed, in 3s...");
   delay(3000);
-  int base[ADC_PINS_N];
-  sampleAll(base);
-  Serial.print("OPEN baseline:");
-  for (int p = 0; p < ADC_PINS_N; p++) Serial.printf(" G%d=%d", ADC_PINS[p], base[p]);
+  int openRaw[N_FINGERS];
+  capturePose(openRaw, 40, 50);
+  for (int i = 0; i < N_FINGERS; i++) openVal[i] = openRaw[i];
+  Serial.print("OPEN :");
+  for (int i = 0; i < N_FINGERS; i++) Serial.printf(" %s=%d", FINGER_NAMES[i], openVal[i]);
   Serial.println();
 
-  /* ---- stage B: one finger at a time, DISCOVER its pin ---- */
-  for (int f = 0; f < N_FINGERS; f++) {
-    Serial.printf("Step %d/5: bend ONLY %s fully, hold it, in 3s...\n", f + 1, FINGER_NAMES[f]);
-    delay(3000);
+  /* ---- stage B: FIST baseline (all five fingers curled) ---- */
+  g_calState = CAL_FIST;
+  g_calStepStartMs = millis();
+  g_calStepDurationMs = 3000;
+  g_calStepName = "Make a FIST - curl all five fingers";
+  Serial.println("Step 2/2: make a FIST (curl ALL five fingers), hold it, in 3s...");
+  delay(3000);
+  int fistRaw[N_FINGERS];
+  capturePose(fistRaw, 40, 50);
+  Serial.print("FIST :");
+  for (int i = 0; i < N_FINGERS; i++) Serial.printf(" %s=%d", FINGER_NAMES[i], fistRaw[i]);
+  Serial.println();
 
-    int bent[ADC_PINS_N];
-    sampleAll(bent, 30, 60);
+  /* ---- derive per-finger thresholds from the two medians ---- */
+  int nAct = 0;
+  for (int i = 0; i < N_FINGERS; i++) {
+    fistVal[i] = fistRaw[i];
+    int travel = fistVal[i] - openVal[i];
+    bool inv = (travel < 0);
+    if (inv) travel = -travel;
+    inverted[i] = inv;
 
-    // whichever unclaimed ADC pin moved furthest from the OPEN baseline is
-    // this finger's sensor - no pin is assumed, and a pin is used once
-    int bestIdx = -1, bestTravel = 0;
-    for (int p = 0; p < ADC_PINS_N; p++) {
-      bool claimed = false;
-      for (int q = 0; q < f; q++) if (FINGER_PINS[q] == ADC_PINS[p]) claimed = true;
-      if (claimed) continue;
-      int tr = abs(bent[p] - base[p]);
-      if (tr > bestTravel) { bestTravel = tr; bestIdx = p; }
-    }
-
-    if (bestIdx < 0 || bestTravel < MIN_TRAVEL) {
-      active[f] = false;
-      Serial.printf(" %s: no pin moved (best travel=%d < %d) -> INACTIVE\n",
-                    FINGER_NAMES[f], bestTravel, MIN_TRAVEL);
-      Serial.println("   back to FLAT...");
-      delay(1200);
+    if (travel < g_cfg.minTravel) {
+      active[i] = false;
+      Serial.printf(" %s: travel=%d < %u -> INACTIVE (check sensor / redo cal)\n",
+                    FINGER_NAMES[i], travel, g_cfg.minTravel);
       continue;
     }
+    active[i] = true;
+    nAct++;
 
-    FINGER_PINS[f] = ADC_PINS[bestIdx];
-    active[f]  = true;
-    openVal[f] = base[bestIdx];
-    fistVal[f] = bent[bestIdx];
+    // threshold at the configured fraction of the way from OPEN to FIST
+    int t = inv ? (openVal[i] - (int)(travel * g_cfg.bendFraction))
+                : (openVal[i] + (int)(travel * g_cfg.bendFraction));
+    thresh[i] = t;
 
-    int travel = bestTravel;
-    bool inv = (fistVal[f] < openVal[f]);      // bent reads BELOW open -> inverted
-    inverted[f] = inv;
-
-    // threshold near the OPEN end, like the tutorial's fixed 200
-    int t = inv ? (openVal[f] - (int)((openVal[f] - fistVal[f]) * BEND_FRACTION))
-                : (openVal[f] + (int)((fistVal[f] - openVal[f]) * BEND_FRACTION));
-    thresh[f] = t;
-
+    // deadband 12% of travel, clamped so tiny sensors still get hysteresis
+    // and big ones don't need a huge swing to flip state
     int db = travel * 12 / 100;
     if (db < 15) db = 15;
     if (db > 60) db = 60;
-    deadb[f] = db;
+    deadb[i] = db;
 
-    Serial.printf(" %s: pin=G%d open=%d bent=%d travel=%d thr=%d db=%d %s OK\n",
-                  FINGER_NAMES[f], FINGER_PINS[f], openVal[f], fistVal[f], travel,
-                  thresh[f], deadb[f], inv ? "(bent=LOW)" : "(bent=HIGH)");
-    Serial.println("   back to FLAT...");
-    delay(1200);
+    Serial.printf(" %s: open=%d fist=%d travel=%d thr=%d db=%d %s OK\n",
+                  FINGER_NAMES[i], openVal[i], fistVal[i], travel,
+                  thresh[i], deadb[i], inv ? "(bent=LOW)" : "(bent=HIGH)");
   }
 
   Serial.print("MAPPING:");
-  for (int f = 0; f < N_FINGERS; f++)
-    Serial.printf(" %s=G%d%s", FINGER_NAMES[f], FINGER_PINS[f], active[f] ? "" : "(off)");
-  Serial.println();
+  for (int i = 0; i < N_FINGERS; i++)
+    Serial.printf(" %s=G%d%s", FINGER_NAMES[i], FINGER_PINS[i], active[i] ? "" : "(off)");
+  Serial.printf("  active=%d/%d\n", nAct, N_FINGERS);
 
   /* ---- stage C: rotation ---- */
-  Serial.println("Rotation: hold hand FLAT, PALM towards you, in 3s...");
-  delay(3000);
+    Serial.println("Rotation: hold hand FLAT, PALM towards you, in 3s...");
+    g_calState = CAL_ROTATE_PALM;
+    g_calStepStartMs = millis();
+    g_calStepDurationMs = 3000;
+    g_calStepName = "Rotate palm toward you";
+    delay(3000);
   if (mpuOK) {
     long ax = 0, ay = 0, az = 0;
     const int N = 30;
@@ -248,6 +792,10 @@ void doCalibration() {
     Serial.printf("PALM vec: (%.1f, %.1f, %.1f)\n", palmVec[0], palmVec[1], palmVec[2]);
 
     Serial.println("Rotation: rotate to BACK of hand towards you, in 3s...");
+    g_calState = CAL_ROTATE_BACK;
+    g_calStepStartMs = millis();
+    g_calStepDurationMs = 3000;
+    g_calStepName = "Rotate back of hand toward you";
     delay(3000);
     ax = ay = az = 0;
     for (int s = 0; s < N; s++) {
@@ -279,6 +827,10 @@ void doCalibration() {
   /* ---- stage D: wrist twist axis ---- */
   if (mpuOK) {
     Serial.println("Twist cal: hold STILL 2s (gyro zero reference)...");
+    g_calState = CAL_STILL;
+    g_calStepStartMs = millis();
+    g_calStepDurationMs = 2000;
+    g_calStepName = "Hold STILL - do not move (gyro zero)";
     delay(2000);
     float bx = 0, by = 0, bz = 0;
     const int NB = 150;
@@ -294,6 +846,10 @@ void doCalibration() {
     Serial.printf("gyro zero: %.3f %.3f %.3f rad/s\n", gyroBias[0], gyroBias[1], gyroBias[2]);
 
     Serial.println("Twist cal: rotate wrist CLOCKWISE (like turning a key) 3s, starting in 2s...");
+    g_calState = CAL_TWIST;
+    g_calStepStartMs = millis();
+    g_calStepDurationMs = 2000;
+    g_calStepName = "Rotate wrist clockwise (like turning a key)";
     delay(2000);
     float sx = 0, sy = 0, sz = 0;
     const int NS = 150;
@@ -311,13 +867,31 @@ void doCalibration() {
     else if (ayv >= axv)          { twistAxis = 1; twistSign = (sy >= 0) ? 1.0f : -1.0f; }
     else                          { twistAxis = 0; twistSign = (sx >= 0) ? 1.0f : -1.0f; }
     twistAngle = 0.0f;
+    sweepAngle = 0.0f;
     Serial.printf("twist axis=%c sign=%s (mean rates x=%.2f y=%.2f z=%.2f rad/s)\n",
                   twistAxis == 0 ? 'x' : (twistAxis == 1 ? 'y' : 'z'),
                   twistSign > 0 ? "+" : "-", sx, sy, sz);
   }
 
+  if (g_cfg.twistAxis >= 0) {
+    twistAxis = g_cfg.twistAxis;
+    Serial.printf("twist axis overridden by config -> %d\n", twistAxis);
+  }
+  if (g_cfg.twistSign != 0.0f) {
+    twistSign = (g_cfg.twistSign > 0) ? 1.0f : -1.0f;
+    Serial.printf("twist sign overridden by config -> %s\n", twistSign > 0 ? "+" : "-");
+  }
+
   Serial.println("=== calibration done. 'c' to redo, 'd' raw, 's' ADC scan, 'z' zero twist ===");
+  g_calState = CAL_DONE;
+  g_calStepDurationMs = 0;
+  g_calStepName = "Calibration complete";
   Serial.println();
+
+  // Persist so the next boot can skip the two poses entirely. Saving here (and
+  // not only from the web button) means a calibration is never lost just
+  // because nobody remembered to press Save.
+  calPersist();
 }
 
 /* ---------------- gesture classification ---------------- */
@@ -381,6 +955,8 @@ void setup() {
   Serial.println("pins: T=36 I=39 M=34 R=35 P=32   (ADC1, 12-bit, 11dB)");
   printHelp();
 
+  cfgLoad(g_cfg);
+
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   for (int i = 0; i < N_FINGERS; i++) pinMode(FINGER_PINS[i], INPUT);
@@ -400,7 +976,7 @@ void setup() {
     Serial.println("MPU6050 missing - fingers only");
   }
 
-  BLEDevice::init(DEVICE_NAME);
+  BLEDevice::init(g_cfg.deviceName);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCB());
   BLEService* svc = pServer->createService(SERVICE_UUID);
@@ -420,14 +996,66 @@ void setup() {
   adv->addServiceUUID(SERVICE_UUID);
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
-  Serial.println("BLE advertising as " DEVICE_NAME " (NUS)");
+  Serial.println("BLE advertising as " + String(g_cfg.deviceName) + " (NUS)");
 
-  doCalibration();
+  pinMode(K1_PIN, INPUT_PULLUP);
+
+  webInit();
+
+  // A stored snapshot replaces the two-pose routine, so power-cycling the
+  // glove no longer costs a recalibration. K1 sits on GPIO23 (a normal GPIO,
+  // not a strap pin), so holding it during reset is harmless - to force a
+  // fresh calibration use 'c' on the console or the web button.
+  if (!calRestore()) doCalibration();
   bleSend("READY\n");
+
+  // Auto-join runs after BLE/AP are already up, so a slow or failing router
+  // never delays the glove or blocks the hotspot.
+  if (g_cfg.wifiEn && g_cfg.wifiSsid[0]) {
+    Serial.printf("auto-join \"%s\"\n", g_cfg.wifiSsid);
+    wifiRequestJoin(g_cfg.wifiSsid, g_cfg.wifiPass);
+  }
+
+  // LAST, so the scanner owns the spare pins (25-27 included).
+  k1ScanSetup();
 }
 
 void printHelp() {
   Serial.println("commands:  c = recalibrate   d = raw 5-pin dump   s = ADC1 scan   z = zero twist   h = help");
+  Serial.println("K1 button: tap = toggle WINDOWS/LED mode   hold 1s = join saved home WiFi");
+}
+
+/* K1: short press toggles the control mode (WINDOWS <-> LED strip); a hold of
+   >=1 s joins the saved home network (2.4 GHz). The hotspot stays up
+   regardless, so a failed join is never a lockout. */
+static void k1Service() {
+  static bool          stable    = false;   // debounced level
+  static unsigned long lastEdge  = 0;
+  static unsigned long downAt    = 0;
+  static bool          longDone  = false;
+
+  bool raw = (digitalRead(K1_PIN) == LOW);
+  if (raw != stable) {
+    if (millis() - lastEdge > K1_DEBOUNCE_MS) {
+      stable   = raw;
+      lastEdge = millis();
+      if (stable) {                       // press: start the long-press window
+        downAt   = millis();
+        longDone = false;
+      } else if (!longDone) {             // release before 1 s: mode toggle
+        setCtlMode(gCtlMode == CTL_LED ? CTL_WINDOWS : CTL_LED);
+      }
+    }
+  }
+  if (stable && !longDone && millis() - downAt >= 1000) {
+    longDone = true;                      // hold: join saved home WiFi
+    if (!g_cfg.wifiSsid[0]) {
+      Serial.println("K1: no saved home WiFi - set one in the portal");
+    } else {
+      Serial.printf("K1: joining \"%s\"\n", g_cfg.wifiSsid);
+      wifiRequestJoin(g_cfg.wifiSsid, g_cfg.wifiPass);
+    }
+  }
 }
 
 /* ---------------- main loop ---------------- */
@@ -436,21 +1064,33 @@ void loop() {
   static bool rawDump   = false;
   static bool scanMode  = false;
 
+  webLoop();
+  k1Service();
+  extern volatile bool g_otaInProgress;
+  if (!g_otaInProgress) stripPoll();
+
+  if (g_recalRequested) {
+    g_recalRequested = false;
+    doCalibration();
+    bleSend("READY\n");
+  }
+
   /* ---- serial console ---- */
   while (Serial.available()) {
     char c = Serial.read();
     if (c == 'c' || c == 'C') doCalibration();
     else if (c == 'd' || c == 'D') { rawDump = !rawDump; Serial.printf("raw dump %s\n", rawDump ? "ON" : "OFF"); }
     else if (c == 's' || c == 'S') { scanMode = !scanMode; Serial.printf("ADC scan %s\n", scanMode ? "ON" : "OFF"); }
-    else if (c == 'z' || c == 'Z') { twistAngle = 0.0f; Serial.println("twist zeroed"); }
+    else if (c == 'z' || c == 'Z') { twistAngle = 0.0f; sweepAngle = 0.0f; Serial.println("twist+sweep zeroed"); }
     else if (c == 'h' || c == 'H') printHelp();
   }
 
-  /* full ADC1 sweep - use this to find which pin a finger actually drives */
+  /* ADC1 sweep of the 6 broken-out pins (G37/G38 absent on WROOM-32D).
+     Use to sanity-check wiring; G33 is the floating spare and should twitch. */
   if (scanMode) {
-    Serial.printf("SCAN 32=%4d 33=%4d 34=%4d 35=%4d 36=%4d 37=%4d 38=%4d 39=%4d\n",
-                  analogRead(32), analogRead(33), analogRead(34), analogRead(35),
-                  analogRead(36), analogRead(37), analogRead(38), analogRead(39));
+    Serial.printf("SCAN 32=%4d 33=%4d 34=%4d 35=%4d 36=%4d 39=%4d\n",
+                  analogRead(32), analogRead(33), analogRead(34),
+                  analogRead(35), analogRead(36), analogRead(39));
     delay(200);
     return;
   }
@@ -571,36 +1211,88 @@ void loop() {
                     (int)(twistAngle + (twistAngle >= 0 ? 0.5f : -0.5f)),
                     twistAngle >= 0 ? "CW" : "CCW", rate);
     }
+
+    /* ---- lateral sweep: yaw about the gravity axis (hand moves L/R) ----
+       A sideways hand sweep changes the hand's HEADING (yaw), not wrist roll,
+       so TWIST's calibrated axis cannot see it. Project the bias-corrected
+       gyro onto the up vector: yaw rate regardless of how the glove is worn.
+       The accel only counts as gravity inside 0.5-1.5 g; during a fast sweep
+       the linear accel can leave that band, so the last good up vector is
+       held (it barely rotates while the arm stays upright). */
+    static float gVec[3] = {0, 0, 1};
+    float amag = sqrtf(ta.acceleration.x * ta.acceleration.x +
+                       ta.acceleration.y * ta.acceleration.y +
+                       ta.acceleration.z * ta.acceleration.z);
+    if (amag > 4.9f && amag < 14.7f) {
+      gVec[0] = ta.acceleration.x / amag;
+      gVec[1] = ta.acceleration.y / amag;
+      gVec[2] = ta.acceleration.z / amag;
+    }
+    float yawRate = ((tg.gyro.x - gyroBias[0]) * gVec[0] +
+                     (tg.gyro.y - gyroBias[1]) * gVec[1] +
+                     (tg.gyro.z - gyroBias[2]) * gVec[2]) * 57.2958f;  // deg/s
+    if (fabs(yawRate) < 3.0f) yawRate = 0.0f;   // deadband: no drift while still
+    sweepAngle += yawRate * dt;
+    if (sweepAngle >  720.0f) sweepAngle =  720.0f;
+    if (sweepAngle < -720.0f) sweepAngle = -720.0f;
+
+    static float         lastSweepSent = 0.0f;
+    static unsigned long lastSweepTx = 0;
+    if (fabs(sweepAngle - lastSweepSent) >= 1.0f || (millis() - lastSweepTx) > 500) {
+      lastSweepSent = sweepAngle;
+      lastSweepTx = millis();
+      char sb[24];
+      snprintf(sb, sizeof(sb), "SWEEP:%d\n", (int)(sweepAngle + (sweepAngle >= 0 ? 0.5f : -0.5f)));
+      bleSend(String(sb));
+      Serial.printf("SWEEP %+d deg yaw %.1f deg/s\n",
+                    (int)(sweepAngle + (sweepAngle >= 0 ? 0.5f : -0.5f)), yawRate);
+    }
+  }
+
+  /* ---- LED mode: wrist twist = speed dial. Crossing +/-60 deg makes one
+     +/-10 speed step; the dial re-arms when the wrist returns near center,
+     so holding a twist fires exactly once per flick. ---- */
+  if (gCtlMode == CTL_LED && mpuOK) {
+    static bool twistArm = true;
+    float absTw = fabs(twistAngle);
+    if (absTw > 60.0f && twistArm) {
+      twistArm = false;
+      ledSpeed = (uint8_t)ledClamp((int)ledSpeed + (twistAngle > 0 ? 10 : -10), 0, 100);
+      ledWrite(ledR, ledG, ledB);
+      Serial.printf("LED: twist dial -> speed %d\n", ledSpeed);
+    } else if (absTw < 20.0f) twistArm = true;
   }
 
   if (changed) {
+    strlcpy(g_lastGesture, lastG.c_str(), sizeof(g_lastGesture));
+    if (gCtlMode == CTL_LED) ledGestureAction(lastG);
     bleSend("GESTURE:" + lastG + "\n");
     Serial.print(">>> "); Serial.print(lastG);
     if (lastRot.length()) Serial.print(" +" + lastRot);
     Serial.println(bleConnected ? " [BLE]" : " [local]");
 #ifdef LED_BUILTIN
-    digitalWrite(LED_BUILTIN, HIGH); delay(60); digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_BUILTIN, LOW); delay(60); digitalWrite(LED_BUILTIN, HIGH);
 #endif
   }
 
-  /* ---- live line every 600ms ---- */
+  /* ---- live line every sendEveryMs ---- */
   static unsigned long lastLive = 0;
-  if (millis() - lastLive > 600) {
+  if (millis() - lastLive > g_cfg.sendEveryMs) {
     lastLive = millis();
     bleSend(String("FINGERS:") + pct[0] + "," + pct[1] + "," + pct[2] + "," +
             pct[3] + "," + pct[4] + "\n");
+    for (int i = 0; i < N_FINGERS; i++) g_livePct[i] = pct[i];
     Serial.printf("T:%d I:%d M:%d R:%d P:%d  raw[%4d %4d %4d %4d %4d]  %s %s\n",
                   bent[0], bent[1], bent[2], bent[3], bent[4],
                   raw[0], raw[1], raw[2], raw[3], raw[4],
                   lastG.c_str(), lastRot.c_str());
   }
 
-#ifdef LED_BUILTIN
   static unsigned long lb = 0;
   static bool led = false;
-  unsigned long iv = bleConnected ? 900 : 350;
-  if (millis() - lb > iv) { lb = millis(); led = !led; digitalWrite(LED_BUILTIN, led); }
-#endif
+  unsigned long iv = (gCtlMode == CTL_LED) ? 150 : (bleConnected ? 1200 : 250);
+  if (millis() - lb > iv) { lb = millis(); led = !led; digitalWrite(LED_BUILTIN, led ? LOW : HIGH); }
 
-  delay(120);
+  k1ScanPoll();
+  delay(20);
 }
