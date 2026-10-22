@@ -2,6 +2,12 @@
 logs/*.log
 logs/*.txt
 *.log
+serial_log.txt
+serial_diag.txt
+serial_diag2.txt
+http_diag.txt
+http_diag2.txt
+k1_poll.txt
 
 # --- python ------------------------------------------------------------
 __pycache__/
@@ -15,10 +21,42 @@ firmware/**/build/
 firmware/**/*.elf
 firmware/**/*.bin
 firmware/**/*.map
+firmware/**/flash_args
+firmware/**/boot_app0.bin
+firmware/**/partitions.csv
+firmware/**/sdkconfig
+firmware/**/build.options.json
 
-# --- editors / OS ------------------------------------------------------
+# --- web frontend build artifacts --------------------------------------
+app/web/dist/
+app/web/tsconfig.tsbuildinfo
+app/web/node_modules/
+
+# --- android ------------------------------------------------------------
+app/android/.gradle/
+app/android/.kotlin/
+app/android/build/
+app/android/app/build/
+app/android/local.properties
+app/android/captures/
+app/android/**/*.apk
+app/android/**/*.aab
+*.hprof
+
+# --- editor / OS -------------------------------------------------------
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
 ~$*
+
+# --- opencode artifacts ------------------------------------------------
+.omo/
+.cache/
+
+# --- sensitive files ---------------------------------------------------
+# Do not commit personal config files with credentials
+config.json
+.env
+*.key
+*.pem

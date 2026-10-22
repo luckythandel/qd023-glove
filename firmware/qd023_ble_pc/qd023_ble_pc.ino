@@ -46,7 +46,7 @@
 #include <WebServer.h>
 #include "cfg_store.h"
 
-#define FW_VERSION "3.2"
+#define FW_VERSION "3.4"
 
 // K1 user button. Discovered empirically with the fw 2.7 pin scanner: a K1
 // press latched "P23" edges (BOOT/GPIO0 stayed silent), so K1 is wired to
@@ -158,6 +158,9 @@ const char* g_calStepName = "Idle";
    is unchanged: portal /api/led, serial LEDx: commands, gestures, K1. */
 #define CTL_WINDOWS 0
 #define CTL_LED     1
+#define CTL_ANDROID 2
+#define CTL_MUSIC   3
+#define CTL_MODES   4
 int gCtlMode = CTL_WINDOWS;
 
 bool    ledPower  = false;
@@ -461,6 +464,7 @@ void doCalibration();
 void printHelp();
 static void cfgRxLine(const String& v);
 static void k1Service();
+static void advertiseForMode(int m);
 
 #include "web_portal.h"
 
@@ -475,8 +479,8 @@ class ServerCB : public BLEServerCallbacks {
   }
   void onDisconnect(BLEServer*) override {
     bleConnected = false;
-    Serial.println("BLE PC disconnected - advertising");
-    BLEDevice::startAdvertising();
+    Serial.println("BLE central disconnected - re-advertising for current mode");
+    advertiseForMode(gCtlMode);
   }
 };
 
@@ -497,19 +501,58 @@ void bleSend(const String& s) {
   }
 }
 
+/* One BLE radio link is shared by the PC bridge and the phone. The advertised
+   name carries the active control mode, so each client only grabs the glove
+   while it owns it: "-W" windows, "-L" LED strip, "-A" android. Switching mode
+   drops the current central and re-tags the advert, which is the handoff. */
+static const char* ctlTag(int m) {
+  if (m == CTL_LED) return "-L";
+  if (m == CTL_ANDROID) return "-A";
+  if (m == CTL_MUSIC) return "-M";
+  return "-W";
+}
+
+static void advertiseForMode(int m) {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->stop();
+
+  String name = String(g_cfg.deviceName) + ctlTag(m);
+  BLEAdvertisementData d;
+  d.setFlags(0x06);  // LE general discoverable, BR/EDR not supported
+  d.setName(name);
+  char man[3] = {(char)0xFF, (char)0xFF, (char)m};  // company id 0xFFFF + mode
+  d.setManufacturerData(String(man, 3));
+  adv->setAdvertisementData(d);
+  adv->start();
+  Serial.println("BLE adv: " + name);
+}
+
 /* control-mode switch: 0 = WINDOWS (media keys), 1 = LED strip. Notifies the
    bridge ("MOD:x") so it can reroute gestures. Leaving LED mode powers the
    wireless strip off immediately; entering it re-syncs the full state once
    the strip link is up. */
 static void setCtlMode(int m) {
-  if (m != CTL_WINDOWS && m != CTL_LED) return;
+  if (m < 0 || m >= CTL_MODES) return;
   if (m == gCtlMode) return;
   int prev = gCtlMode;
   gCtlMode = m;
   if (prev == CTL_LED) stripPowerOff();
   g_ledDirty = true;
+
+  // Tell the current central which mode won before taking the link away.
   bleSend(String("MOD:") + m + "\n");
-  Serial.printf("mode: %s\n", m == CTL_LED ? "LED STRIP" : "WINDOWS");
+
+  bool wasConnected = bleConnected;
+  if (wasConnected && pServer) {
+    pServer->disconnect(pServer->getConnId());  // onDisconnect re-advertises
+  }
+  if (!wasConnected) advertiseForMode(m);
+
+  const char* name = (m == CTL_LED)      ? "LED STRIP"
+                     : (m == CTL_ANDROID) ? "ANDROID"
+                     : (m == CTL_MUSIC)   ? "MUSIC"
+                                          : "WINDOWS";
+  Serial.printf("mode: %s\n", name);
 }
 
 // The PC bridge pulls the shared thresholds after it subscribes, and pushes
@@ -992,11 +1035,8 @@ void setup() {
 
   svc->start();
 
-  BLEAdvertising* adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(SERVICE_UUID);
-  adv->setScanResponse(true);
-  BLEDevice::startAdvertising();
-  Serial.println("BLE advertising as " + String(g_cfg.deviceName) + " (NUS)");
+  advertiseForMode(gCtlMode);
+  Serial.println("BLE advertising in mode: " + String(ctlTag(gCtlMode)) + " (NUS)");
 
   pinMode(K1_PIN, INPUT_PULLUP);
 
@@ -1022,7 +1062,7 @@ void setup() {
 
 void printHelp() {
   Serial.println("commands:  c = recalibrate   d = raw 5-pin dump   s = ADC1 scan   z = zero twist   h = help");
-  Serial.println("K1 button: tap = toggle WINDOWS/LED mode   hold 1s = join saved home WiFi");
+  Serial.println("K1 button: tap = cycle WINDOWS/LED/ANDROID mode   hold 1s = join saved home WiFi");
 }
 
 /* K1: short press toggles the control mode (WINDOWS <-> LED strip); a hold of
@@ -1042,8 +1082,8 @@ static void k1Service() {
       if (stable) {                       // press: start the long-press window
         downAt   = millis();
         longDone = false;
-      } else if (!longDone) {             // release before 1 s: mode toggle
-        setCtlMode(gCtlMode == CTL_LED ? CTL_WINDOWS : CTL_LED);
+      } else if (!longDone) {             // release before 1 s: mode cycle
+        setCtlMode((gCtlMode + 1) % CTL_MODES);
       }
     }
   }
@@ -1286,6 +1326,25 @@ void loop() {
                   bent[0], bent[1], bent[2], bent[3], bent[4],
                   raw[0], raw[1], raw[2], raw[3], raw[4],
                   lastG.c_str(), lastRot.c_str());
+  }
+
+  /* ---- music mode: fast finger bitmask for the synth ----
+     Finger events must land within a few tens of milliseconds to feel like
+     an instrument, so music mode streams its own compact frame instead of
+     waiting for the 1.2 s live line. Bit i = finger i closed (bent[] order:
+     thumb, index, middle, ring, pinky). */
+  static unsigned long lastMus = 0;
+  static uint8_t lastMask = 0xFF;
+  if (gCtlMode == CTL_MUSIC && bleConnected) {
+    uint8_t mask = 0;
+    for (int i = 0; i < N_FINGERS; i++) {
+      if (bent[i]) mask |= (1 << i);
+    }
+    if (mask != lastMask || millis() - lastMus > 400) {
+      lastMask = mask;
+      lastMus = millis();
+      bleSend(String("MUS:") + mask + "\n");
+    }
   }
 
   static unsigned long lb = 0;

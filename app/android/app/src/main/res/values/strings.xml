@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">QD023 GLOVE</string>
+    <string name="accessibility_service_description">Allows the QD023 glove to perform swipe and tap gestures on Android.</string>
+    <string name="mode_windows">Windows</string>
+    <string name="mode_led">LED strip</string>
+    <string name="mode_android">Android</string>
+</resources>

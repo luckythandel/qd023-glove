@@ -345,6 +345,8 @@ class GestureEngine:
         # LED strip control mode: when the glove reports MOD:1 the bridge
         # reroutes gestures to the strip instead of Windows media keys.
         self.led_mode = False
+        self.android_mode = False
+        self.windows_mode = True
         self._led_sink: Optional[Callable[[str], None]] = None
 
     def set_bindings(self, bindings: Dict[str, str]) -> None:
@@ -439,6 +441,8 @@ class GestureEngine:
         """
         # rot gates read the angle outside MID_RING too, so record before gating
         self._rot_deg = float(deg)
+        if self.android_mode:
+            return (None, None)
         if self.active_pose == "RING_ONLY":
             return (None, None)
         if self.active_pose != "MID_RING":
@@ -454,6 +458,8 @@ class GestureEngine:
         or the backend-switch check inside _abs_fsm clears stale state on the
         next twist packet).
         """
+        if self.android_mode:
+            return (None, None)
         if self.active_pose != "RING_ONLY":
             self._sweep_in_ring = False
             return (None, None)
@@ -946,6 +952,145 @@ async def brightness_pump(stop: asyncio.Event) -> None:
         await asyncio.sleep(0.05)
 
 # ---------------------------------------------------------------------------
+# PC synthesizer (music mode)
+# ---------------------------------------------------------------------------
+class PcSynth:
+    """Five-voice pentatonic synth driven as a child process.
+
+    The child (pc_synth.py) owns PortAudio. Importing sounddevice in this
+    process would call Pa_Initialize(), which puts the thread into a
+    single-threaded COM apartment and breaks bleak's WinRT callbacks, so the
+    audio stack is kept out of the BLE process entirely.
+
+    Protocol: one JSON object per line on the child's stdin.
+    """
+
+    NAMES = ("C", "D", "E", "G", "A")
+
+    def __init__(self) -> None:
+        self._proc: Optional[subprocess.Popen] = None
+        self._script = Path(__file__).with_name("pc_synth.py")
+        self._octave = 0
+        self.mask = 0
+        self.error: Optional[str] = None
+
+    @property
+    def available(self) -> bool:
+        return self._script.exists()
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self) -> None:
+        if not self.available or self.running:
+            return
+        try:
+            flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+            self._proc = subprocess.Popen(
+                [sys.executable, str(self._script)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                creationflags=flags,
+            )
+            log.info("PC synth process started")
+        except Exception as exc:
+            self.error = str(exc)
+            self._proc = None
+            log.warning("PC synth unavailable: %s", exc)
+
+    def _send(self, obj: Dict[str, Any]) -> None:
+        if not self.running:
+            self.start()
+        if not self.running or self._proc is None or self._proc.stdin is None:
+            return
+        try:
+            self._proc.stdin.write(json.dumps(obj) + "\n")
+            self._proc.stdin.flush()
+        except Exception:
+            self.error = "synth pipe closed"
+            self._proc = None
+
+    def stop(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write('{"q": 1}\n')
+                    proc.stdin.flush()
+                proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self.mask = 0
+        self._octave = 0
+
+    def set_fingers(self, mask: int) -> None:
+        self.mask = mask
+        self._send({"m": mask})
+
+    def set_bend(self, deg: float) -> None:
+        self._octave = 1 if deg > 45 else (-1 if deg < -45 else 0)
+        self._send({"b": round(deg, 2)})
+
+    def note_names(self) -> List[str]:
+        return [
+            f"{self.NAMES[i]}{5 + self._octave}"
+            for i in range(5)
+            if self.mask & (1 << i)
+        ]
+
+
+def list_audio_outputs() -> List[Dict[str, Any]]:
+    """Enumerate devices that can act as a synthesizer output on this PC."""
+    try:
+        import sounddevice as sd  # type: ignore
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    try:
+        default_out = None
+        try:
+            default_out = sd.default.device[1]
+        except Exception:
+            pass
+        for idx, d in enumerate(sd.query_devices()):
+            if int(d.get("max_output_channels", 0)) <= 0:
+                continue
+            hostapi = str(sd.query_hostapis(d["hostapi"])["name"])
+            # WDM-KS re-lists every endpoint in raw form; it only adds noise.
+            if "WDM-KS" in hostapi:
+                continue
+            name = str(d.get("name", "")).strip()
+            if not name:
+                continue
+            key = name.lower() + "|" + hostapi
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "index": idx,
+                    "name": name,
+                    "hostapi": hostapi,
+                    "channels": int(d.get("max_output_channels", 0)),
+                    "samplerate": int(d.get("default_samplerate", 0)),
+                    "default": idx == default_out,
+                }
+            )
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
 # WebSocket hub
 # ---------------------------------------------------------------------------
 class Hub:
@@ -980,9 +1125,10 @@ class Hub:
 # Bridge core
 # ---------------------------------------------------------------------------
 class Bridge:
-    def __init__(self, device_name: str, simulate: bool) -> None:
+    def __init__(self, device_name: str, simulate: bool, claim_music: bool = False) -> None:
         self.device_name = device_name
         self.simulate = simulate
+        self.claim_music = claim_music
         self.hub = Hub()
         cfg = load_config()
         self.bindings = cfg["bindings"]
@@ -990,7 +1136,9 @@ class Bridge:
         self.custom = cfg["custom"]
         self.engine = GestureEngine(self.bindings, self.thresholds, self.custom)
         self.engine._led_sink = self._send_ble
+        self.synth = PcSynth()
         self.connected = False
+        self.mode = 0
         self.device_label = device_name
         self._rx_buf = b""
         self._client: Any = None  # bleak client
@@ -1021,12 +1169,14 @@ class Bridge:
                 cmd = LED_ACTION_MAP.get(action)
                 if cmd:
                     self._send_ble(cmd)
-            else:
+            elif self.engine.windows_mode:
                 err = fire_media_key(action)
                 if err:
                     await self.hub.broadcast(
                         {"type": "log", "level": "error", "msg": f"media key failed: {err}"}
                     )
+            # Android mode: the Android controller handles dispatch; this
+            # bridge stays passive (no Windows media keys, no strip commands).
 
     def _send_ble(self, text: str) -> None:
         client = self._client
@@ -1095,6 +1245,29 @@ class Bridge:
         if line.startswith("TWD:"):
             await self._apply_glove_twist(line)
             return
+        if line.startswith("MUS:"):
+            try:
+                mask = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return
+            if self.synth.available:
+                if not self.synth.running:
+                    self.synth.start()
+                self.synth.set_fingers(mask)
+            await self.hub.broadcast(
+                {"type": "music", "mask": mask, "notes": self.synth.note_names()}
+            )
+            return
+        if line.startswith("MOD:"):
+            try:
+                mode = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return
+            if mode != 3:
+                self.synth.stop()
+            self.mode = mode
+            await self.hub.broadcast({"type": "mode", "mode": mode})
+            return
         if line.startswith("FINGERS:"):
             try:
                 parts = line.split(":", 1)[1].split(",")
@@ -1137,6 +1310,10 @@ class Bridge:
                 deg = TWIST_INPUT_SIGN * float(line.split(":", 1)[1])
             except ValueError:
                 return
+            if self.mode == 3 and self.synth.available:
+                if not self.synth.running:
+                    self.synth.start()
+                self.synth.set_bend(deg)
             key_action, flash = self.engine.on_twist(deg)
             await self.hub.broadcast(
                 {
@@ -1194,10 +1371,15 @@ class Bridge:
             except ValueError:
                 return
             self.engine.led_mode = (m == 1)
+            self.engine.android_mode = (m == 2)
+            self.engine.windows_mode = (m == 0)
             await self.hub.broadcast({"type": "mode", "ctl": m})
 
     async def set_connection(self, up: bool, label: Optional[str] = None) -> None:
         self.connected = up
+        if not up:
+            # never leave a note ringing after the glove drops the link
+            self.synth.stop()
         if label:
             self.device_label = label
         await self.hub.broadcast(
@@ -1216,13 +1398,50 @@ class Bridge:
             log.warning("BLE disconnected")
             self._connected_evt.clear()
 
+        async def find_in_windows_mode():
+            """Only take the link while the glove advertises Windows mode.
+
+            The firmware puts the active control mode in manufacturer data
+            (company 0xFFFF, one mode byte) and repeats it in the BLE name
+            (QD023-Glove-W / -L / -A). The data byte wins because it cannot be
+            a stale cached name; the name is the fallback for older firmware.
+            """
+            hit: dict[str, Any] = {}
+            # Mode 0 = Windows control. With --music the bridge also claims
+            # music mode (3) so this PC can be the synthesizer.
+            wanted = {0} | ({3} if self.claim_music else set())
+
+            def _cb(dev: Any, adv: Any) -> None:
+                if "dev" in hit:
+                    return
+                md = (getattr(adv, "manufacturer_data", None) or {}).get(0xFFFF)
+                if md:
+                    if md[0] in wanted:
+                        hit["dev"] = dev
+                    return
+                name = getattr(adv, "local_name", None) or dev.name or ""
+                tags = [f"{self.device_name}-W"]
+                if self.claim_music:
+                    tags.append(f"{self.device_name}-M")
+                if name in tags or name == self.device_name:
+                    hit["dev"] = dev
+
+            scanner = BleakScanner(detection_callback=_cb)
+            await scanner.start()
+            try:
+                for _ in range(30):  # ~6 s
+                    if "dev" in hit:
+                        break
+                    await asyncio.sleep(0.2)
+            finally:
+                await scanner.stop()
+            return hit.get("dev")
+
         while not self._stop.is_set():
             try:
-                log.info("scanning for %s ...", self.device_name)
+                log.info("scanning for %s in WINDOWS mode ...", self.device_name)
                 await self.set_connection(False)
-                dev = await BleakScanner.find_device_by_name(
-                    self.device_name, timeout=10.0
-                )
+                dev = await find_in_windows_mode()
                 if dev is None:
                     log.warning("device not found, retrying in 3s")
                     await asyncio.sleep(3.0)
@@ -1336,6 +1555,7 @@ class Bridge:
                         "type": "connection",
                         "connected": self.connected,
                         "device": self.device_label,
+                        "music": self.claim_music,
                     }
                 )
             )
@@ -1388,8 +1608,22 @@ async def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--device-name", default="QD023-Glove")
     parser.add_argument("--simulate", action="store_true")
+    parser.add_argument("--music", action="store_true",
+                        help="also take music mode (-M) and synthesize on this PC")
+    parser.add_argument("--list-audio", action="store_true",
+                        help="list audio outputs that can act as a synthesizer, then exit")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.list_audio:
+        rows = list_audio_outputs()
+        if not rows:
+            print("no audio output devices found (is sounddevice installed?)")
+        for d in rows:
+            mark = "  [default]" if d["default"] else ""
+            print(f"{d['index']:>2}  {d['name']}  ({d['hostapi']}, "
+                  f"{d['channels']}ch, {d['samplerate']} Hz){mark}")
+        return
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1402,7 +1636,7 @@ async def main() -> None:
         log.error("websockets not installed")
         sys.exit(1)
 
-    bridge = Bridge(args.device_name, args.simulate)
+    bridge = Bridge(args.device_name, args.simulate, claim_music=args.music)
     bri = asyncio.create_task(brightness_pump(bridge._stop))
 
     async with websockets.serve(

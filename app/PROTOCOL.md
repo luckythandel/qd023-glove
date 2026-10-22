@@ -121,11 +121,28 @@ While `MID_RING` is the active pose, wrist rotation sets **absolute** system vol
 
 ## Glove BLE (bridge side only)
 
-- Name: `QD023-Glove` (override with `cfg.deviceName` on the glove portal)
+- Name: `QD023-Glove`, suffixed with the active control mode:
+  `-W` (Windows), `-L` (LED), `-A` (Android), `-M` (Music)
+- Manufacturer data: company id `0xFFFF`, one byte = mode. This byte is
+  authoritative; the name can be a stale GAP cache on Windows/Android.
 - NUS service `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`
 - TX (notify) `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`
 - RX (write) `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
 - Lines newline-terminated; `FINGERS:0,0,0,0,0` every `sendEveryMs` (default 600 ms) after cal.
+
+### Music mode frames (firmware 3.4+)
+
+Sent only while the glove is in music mode (`ctl = 3`).
+
+| direction | line | meaning |
+|---|---|---|
+| glove → client | `MUS:<mask>` | finger bitmask, bit 0 = thumb … bit 4 = pinky; sent when it changes plus a 400 ms heartbeat |
+| glove → client | `TWIST:<deg>` | unchanged; the client maps it to pitch bend |
+| client → glove | `MOD:<0..3>` | set control mode (disconnects the current central) |
+| client → glove | `GETMODE` | reply `MOD:<n>` with the current mode |
+
+Bridge side: `MUS:` is mirrored to WebSocket clients as
+`{"type":"music","mask":n,"notes":["C5",...]}`.
 
 ### Threshold sync
 

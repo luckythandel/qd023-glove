@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark arcade shell: no white flash before Compose draws. -->
+    <style name="Theme.Qd023Glove" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg_deep</item>
+        <item name="android:statusBarColor">@color/bg_deep</item>
+        <item name="android:navigationBarColor">@color/bg_deep</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">@color/neon_cyan</item>
+    </style>
+</resources>

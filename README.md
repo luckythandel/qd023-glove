@@ -9,6 +9,7 @@ qd023-glove/
 │       ├── qd023_ble_pc.ino   # Main sketch
 │       └── web_portal.h       # Built-in web server + OTA handler
 ├── app/
+│   ├── android/               # Android controller app (Kotlin + Compose)
 │   ├── bridge/
 │   │   └── glove_bridge.py    # Python BLE bridge (Windows)
 │   └── web/
@@ -240,6 +241,60 @@ curl http://192.168.1.7/api/modes
 | TWIST CW | Speed +10 | Scroll up |
 | TWIST CCW | Speed -10 | Scroll down |
 
+### Control Modes (K1 Button)
+
+The glove has **four** control modes, cycled by a short press of the **K1**
+button (long press >1s joins saved home WiFi). The current mode is broadcast
+over BLE as `MOD:<n>`, advertised in the device name as `-W/-L/-A/-M` plus a
+manufacturer-data mode byte, and shown in `/api/status` as `ctl`.
+
+| Mode | Value | BLE tag | Who acts | What happens |
+|---|---|---|---|---|
+| Windows | 0 | `-W` | PC bridge (`app/bridge`) | Gestures → media keys, volume, mouse, brightness |
+| LED strip | 1 | `-L` | Glove (direct) | Gestures → LED strip over BLE (power, color, effects, speed) |
+| Android | 2 | `-A` | Android app | Gestures → Android media/volume/brightness/actions |
+| Music | 3 | `-M` | Android app **or** PC bridge | Five fingers → five notes, wrist twist → pitch bend |
+
+Leaving LED mode powers the wireless strip off immediately.
+
+**One link at a time.** The firmware only advertises the current mode tag, so
+the PC bridge and the phone never fight over the glove: switch modes and the
+old client is disconnected, the new one connects within a few seconds.
+
+### Music Hand Mode
+
+Music mode turns the glove into a five-voice instrument:
+
+- **Thumb, index, middle, ring, pinky** gate **C5, D5, E5, G5, A5** (C-major
+  pentatonic, so any finger combination is consonant).
+- **Wrist twist** bends pitch ±2 semitones across ±30°, and past ±45° the whole
+  hand jumps an octave.
+- Note events stream as a compact `MUS:<mask>` frame every time the finger
+  mask changes (bit 0 = thumb), with a 400 ms heartbeat.
+
+Two outputs are supported:
+
+| Output | How |
+|---|---|
+| **Phone** | Start the Android app; it claims `-M` and plays through `SynthEngine` (AudioTrack, 48 kHz, ~40 ms latency) |
+| **PC** | Run the bridge with `--music`; `pc_synth.py` renders the same scale with numpy/PortAudio |
+
+Only one of them can hold the BLE link, so pick one (the phone app is the
+default owner of `-M`; the bridge only takes it when started with `--music`).
+
+### Find a Synthesizer Output
+
+```powershell
+cd app\bridge
+python scan_synth.py            # audio outputs, adb phones, BLE, LAN hosts
+python scan_synth.py --no-lan   # skip the subnet sweep
+python scan_synth.py --json     # machine readable
+```
+
+It reports this PC's audio outputs, Android devices attached over adb, nearby
+BLE devices (including the glove and the mode it advertises) and LAN hosts
+exposing synth-ish ports (RTP-MIDI 5004, OSC 9000, adb 5555, the bridge 8787).
+
 ### Requirements
 
 - A pose must be held for **3 samples (~60ms)** to register
@@ -263,10 +318,17 @@ pip install bleak pyautogui pycaw
 ```powershell
 cd C:\Users\lucky\qd023-glove\app\bridge
 python glove_bridge.py
+
+# or, to also take music mode and synthesize on this PC:
+python glove_bridge.py --music
+
+# list audio outputs that can act as a synthesizer:
+python glove_bridge.py --list-audio
 ```
 
 The bridge:
-- Connects to `QD023-Glove` via BLE
+- Connects to `QD023-Glove` via BLE (only while the glove advertises `-W`,
+  plus `-M` when started with `--music`)
 - Listens on WebSocket `ws://127.0.0.1:8787`
 - Translates gestures to keyboard/mouse events
 - Auto-reconnects if the link drops
